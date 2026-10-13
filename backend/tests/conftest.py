@@ -101,35 +101,54 @@ async def create_tables() -> AsyncGenerator[None, None]:
     This fixture is function-scoped so setup and cleanup run in the
     test's event loop. It may only operate on the guarded havn_test DB.
     """
+    if test_url.database != "havn_test":
+        pytest.fail(
+            f"Safety guard: refusing test-fixture operation on non-test database {test_url.database!r}"
+        )
+
     try:
         async with test_engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
     except Exception as exc:
-        in_ci = os.getenv("CI", "").lower() in {"true", "1", "yes"}
-        require_tests = (
-            os.getenv("REQUIRE_INTEGRATION_TESTS", "").lower()
-            in {"true", "1", "yes"}
-        )
-
-        if in_ci or require_tests:
-            pytest.fail(
-                f"PostgreSQL test database is required but setup failed: {exc}"
-            )
-
-        pytest.skip(
-            f"PostgreSQL test database setup failed: {exc}"
+        pytest.fail(
+            f"PostgreSQL test database setup failed on database '{test_url.database}': {exc}\n"
+            "Actionable diagnostic: verify Docker container 'havn-postgres' is running on port 5433 "
+            "and that TEST_DATABASE_URL targets havn_test."
         )
 
     try:
         yield
     finally:
+        if test_url.database != "havn_test":
+            raise RuntimeError(
+                f"Safety guard: refusing destructive cleanup on non-test database {test_url.database!r}"
+            )
         try:
             async with test_engine.begin() as conn:
                 await conn.run_sync(Base.metadata.drop_all)
+                # Safely clean up any custom enum types created during testing in public schema
+                from sqlalchemy import text
+                await conn.execute(
+                    text("""
+                        DO $$
+                        DECLARE
+                            r RECORD;
+                        BEGIN
+                            FOR r IN (
+                                SELECT typname 
+                                FROM pg_type t 
+                                JOIN pg_namespace n ON t.typnamespace = n.oid 
+                                WHERE n.nspname = 'public' AND t.typtype = 'e'
+                            ) LOOP
+                                EXECUTE 'DROP TYPE IF EXISTS public.' || quote_ident(r.typname) || ' CASCADE';
+                            END LOOP;
+                        END $$;
+                    """)
+                )
         except Exception:
+            # If drop_all encounters foreign key or dependency deadlocks, reset public schema safely in havn_test
             async with test_engine.begin() as conn:
                 from sqlalchemy import text
-
                 await conn.execute(
                     text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
                 )

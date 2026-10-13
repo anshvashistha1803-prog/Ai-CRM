@@ -9,6 +9,7 @@ from typing import Any
 
 import structlog
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -49,32 +50,56 @@ class WhatsAppWebhookService:
         logger.warning("whatsapp_webhook_verification_failed", mode=mode)
         raise AuthenticationError("Invalid webhook verification token.")
 
-    def verify_signature(self, payload_bytes: bytes, signature_header: str) -> bool:
-        """Verify HMAC-SHA256 signature from Meta."""
+    def verify_signature(
+        self,
+        payload_bytes: bytes,
+        signature_header: str | None,
+        *,
+        allow_missing_secret: bool = False,
+    ) -> bool:
+        """
+        Verify HMAC-SHA256 signature from Meta.
+        Fails closed if signature_header is missing/empty, or if whatsapp_app_secret
+        is not configured (unless allow_missing_secret is explicitly enabled for tests).
+        """
+        if not signature_header:
+            logger.warning("whatsapp_webhook_signature_missing")
+            return False
+
         if not settings.whatsapp_app_secret:
-            # When app secret is not configured in dev/testing, allow requests with structured log
-            logger.warning("whatsapp_app_secret_not_configured_skipping_signature_verification")
-            return True
+            if allow_missing_secret:
+                logger.warning("whatsapp_app_secret_not_configured_test_override")
+                return True
+            logger.error("whatsapp_app_secret_not_configured_failing_closed")
+            return False
+
         return verify_whatsapp_signature(payload_bytes, signature_header)
 
     async def _resolve_tenant(self, phone_number_id: str | None) -> Tenant | None:
-        """Map Meta phone_number_id to the owning Tenant."""
-        if phone_number_id:
-            res = await self.db.execute(
-                select(Tenant).where(
-                    Tenant.whatsapp_phone_number_id == phone_number_id,
-                    Tenant.is_deleted.is_(False),
-                )
-            )
-            tenant = res.scalars().first()
-            if tenant:
-                return tenant
+        """
+        Map Meta phone_number_id to the owning Tenant.
+        Strict multi-tenant isolation: returns None if phone_number_id is missing
+        or cannot be matched to an active tenant. Never falls back to arbitrary tenants.
+        """
+        if not phone_number_id:
+            logger.warning("whatsapp_phone_number_id_missing")
+            return None
 
-        # Fallback to the first active tenant if single-tenant or mock
         res = await self.db.execute(
-            select(Tenant).where(Tenant.is_deleted.is_(False)).limit(1)
+            select(Tenant).where(
+                Tenant.whatsapp_phone_number_id == phone_number_id,
+                Tenant.is_deleted.is_(False),
+            )
         )
-        return res.scalars().first()
+        tenant = res.scalars().first()
+        if not tenant:
+            logger.warning(
+                "whatsapp_phone_number_id_unmapped",
+                phone_number_id=phone_number_id,
+            )
+            return None
+
+        return tenant
 
     async def process_inbound_webhook(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         """
@@ -145,117 +170,170 @@ class WhatsAppWebhookService:
                     )
                     lead = lead_res.scalars().first()
 
-                    async with self.db.begin_nested() if self.db.in_transaction() else self.db.begin():
-                        if is_opt_out:
+                    try:
+                        async with self.db.begin_nested() if self.db.in_transaction() else self.db.begin():
+                            if is_opt_out:
+                                if lead:
+                                    lead.do_not_contact = True
+                                    lead.stage = LeadStage.DO_NOT_CONTACT.value
+                                    lead.automation_status = "OPTED_OUT"
+                                    lead.last_activity_at = now
+
+                                    consent = ConsentRecord(
+                                        id=uuid.uuid4(),
+                                        tenant_id=tenant.id,
+                                        lead_id=lead.id,
+                                        consent_type="WHATSAPP",
+                                        granted=False,
+                                        channel="WHATSAPP",
+                                        consent_text=f"User texted opt-out keyword: '{text}'",
+                                        created_at=now,
+                                    )
+                                    self.db.add(consent)
+
+                                    activity = LeadActivity(
+                                        id=uuid.uuid4(),
+                                        tenant_id=tenant.id,
+                                        lead_id=lead.id,
+                                        actor_type="SYSTEM",
+                                        activity_type="CONSENT_REVOKED",
+                                        description="WhatsApp consent revoked by user opt-out keyword",
+                                        metadata_={"keyword": text},
+                                        created_at=now,
+                                    )
+                                    self.db.add(activity)
+
+                                logger.info("whatsapp_lead_opted_out", phone_hash=phone_hash, tenant_id=str(tenant.id))
+                                processed_events.append({"action": "opt_out", "lead_id": str(lead.id) if lead else None})
+                                continue
+
+                            # Active lead creation or update
                             if lead:
-                                lead.do_not_contact = True
-                                lead.stage = LeadStage.DO_NOT_CONTACT.value
-                                lead.automation_status = "OPTED_OUT"
+                                lead.raw_message_text = f"{lead.raw_message_text or ''}\nClient: {text}".strip()
                                 lead.last_activity_at = now
+                                activity = LeadActivity(
+                                    id=uuid.uuid4(),
+                                    tenant_id=tenant.id,
+                                    lead_id=lead.id,
+                                    actor_type="USER",
+                                    activity_type="WHATSAPP_MESSAGE_RECEIVED",
+                                    description=f"Inbound message: {text[:100]}",
+                                    metadata_={"wamid": msg.get("id"), "text": text},
+                                    created_at=now,
+                                )
+                                self.db.add(activity)
+                                action = "updated"
+                            else:
+                                lead_id = uuid.uuid4()
+                                lead = Lead(
+                                    id=lead_id,
+                                    tenant_id=tenant.id,
+                                    source="WHATSAPP",
+                                    full_name=sender_name,
+                                    phone_e164_enc=encrypt_field(norm_phone),
+                                    phone_hash=phone_hash,
+                                    preferred_contact="WHATSAPP",
+                                    stage=LeadStage.NEW.value,
+                                    raw_message_text=f"Client: {text}",
+                                    last_activity_at=now,
+                                    created_at=now,
+                                    updated_at=now,
+                                    is_deleted=False,
+                                )
+                                self.db.add(lead)
 
                                 consent = ConsentRecord(
                                     id=uuid.uuid4(),
                                     tenant_id=tenant.id,
-                                    lead_id=lead.id,
+                                    lead_id=lead_id,
                                     consent_type="WHATSAPP",
-                                    granted=False,
+                                    granted=True,
                                     channel="WHATSAPP",
-                                    consent_text=f"User texted opt-out keyword: '{text}'",
+                                    consent_text="Inbound WhatsApp message initiated by user",
                                     created_at=now,
-                                )
+                                    )
                                 self.db.add(consent)
 
                                 activity = LeadActivity(
                                     id=uuid.uuid4(),
                                     tenant_id=tenant.id,
-                                    lead_id=lead.id,
+                                    lead_id=lead_id,
                                     actor_type="SYSTEM",
-                                    activity_type="CONSENT_REVOKED",
-                                    description="WhatsApp consent revoked by user opt-out keyword",
-                                    metadata_={"keyword": text},
+                                    activity_type="LEAD_CREATED",
+                                    description="Lead automatically created from inbound WhatsApp message",
+                                    metadata_={"wamid": msg.get("id")},
                                     created_at=now,
                                 )
                                 self.db.add(activity)
+                                action = "created"
 
-                            logger.info("whatsapp_lead_opted_out", phone_hash=phone_hash, tenant_id=str(tenant.id))
-                            processed_events.append({"action": "opt_out", "lead_id": str(lead.id) if lead else None})
-                            continue
-
-                        # Active lead creation or update
-                        if lead:
-                            lead.raw_message_text = f"{lead.raw_message_text or ''}\nClient: {text}".strip()
-                            lead.last_activity_at = now
-                            activity = LeadActivity(
-                                id=uuid.uuid4(),
+                            # Enqueue background outbox task for AI qualification
+                            await outbox_svc.enqueue_message(
                                 tenant_id=tenant.id,
-                                lead_id=lead.id,
-                                actor_type="USER",
-                                activity_type="WHATSAPP_MESSAGE_RECEIVED",
-                                description=f"Inbound message: {text[:100]}",
-                                metadata_={"wamid": msg.get("id"), "text": text},
-                                created_at=now,
+                                event_type="AI_QUALIFICATION_REQUESTED",
+                                aggregate_type="LEAD",
+                                aggregate_id=lead.id,
+                                payload={
+                                    "message_text": text,
+                                    "source": "WHATSAPP",
+                                    "sender_phone": norm_phone,
+                                },
+                                idempotency_key=f"qual-{msg.get('id')}",
                             )
-                            self.db.add(activity)
+
+                            await self.db.flush()
+                    except IntegrityError as exc:
+                        # Concurrency collision: another request created the lead for this (tenant, phone_hash)
+                        err_msg = str(exc).lower()
+                        if "uq_leads" in err_msg or "phone" in err_msg or "unique" in err_msg:
+                            logger.info(
+                                "whatsapp_concurrent_lead_collision_reusing_existing",
+                                phone_hash=phone_hash,
+                                tenant_id=str(tenant.id),
+                            )
+                            # Re-query the existing lead within the same tenant to guarantee tenant isolation
+                            lead_res = await self.db.execute(
+                                select(Lead).where(
+                                    Lead.tenant_id == tenant.id,
+                                    Lead.phone_hash == phone_hash,
+                                    Lead.is_deleted.is_(False),
+                                )
+                            )
+                            lead = lead_res.scalars().first()
+                            if not lead:
+                                raise
+
+                            # Reuse the existing lead: record activity and qualification
+                            async with self.db.begin_nested() if self.db.in_transaction() else self.db.begin():
+                                lead.raw_message_text = f"{lead.raw_message_text or ''}\nClient: {text}".strip()
+                                lead.last_activity_at = now
+                                activity = LeadActivity(
+                                    id=uuid.uuid4(),
+                                    tenant_id=tenant.id,
+                                    lead_id=lead.id,
+                                    actor_type="USER",
+                                    activity_type="WHATSAPP_MESSAGE_RECEIVED",
+                                    description=f"Inbound message: {text[:100]}",
+                                    metadata_={"wamid": msg.get("id"), "text": text},
+                                    created_at=now,
+                                )
+                                self.db.add(activity)
+                                await outbox_svc.enqueue_message(
+                                    tenant_id=tenant.id,
+                                    event_type="AI_QUALIFICATION_REQUESTED",
+                                    aggregate_type="LEAD",
+                                    aggregate_id=lead.id,
+                                    payload={
+                                        "message_text": text,
+                                        "source": "WHATSAPP",
+                                        "sender_phone": norm_phone,
+                                    },
+                                    idempotency_key=f"qual-{msg.get('id')}",
+                                )
+                                await self.db.flush()
                             action = "updated"
                         else:
-                            lead_id = uuid.uuid4()
-                            lead = Lead(
-                                id=lead_id,
-                                tenant_id=tenant.id,
-                                source="WHATSAPP",
-                                full_name=sender_name,
-                                phone_e164_enc=encrypt_field(norm_phone),
-                                phone_hash=phone_hash,
-                                preferred_contact="WHATSAPP",
-                                stage=LeadStage.NEW.value,
-                                raw_message_text=f"Client: {text}",
-                                last_activity_at=now,
-                                created_at=now,
-                                updated_at=now,
-                                is_deleted=False,
-                            )
-                            self.db.add(lead)
-
-                            consent = ConsentRecord(
-                                id=uuid.uuid4(),
-                                tenant_id=tenant.id,
-                                lead_id=lead_id,
-                                consent_type="WHATSAPP",
-                                granted=True,
-                                channel="WHATSAPP",
-                                consent_text="Inbound WhatsApp message initiated by user",
-                                created_at=now,
-                            )
-                            self.db.add(consent)
-
-                            activity = LeadActivity(
-                                id=uuid.uuid4(),
-                                tenant_id=tenant.id,
-                                lead_id=lead_id,
-                                actor_type="SYSTEM",
-                                activity_type="LEAD_CREATED",
-                                description="Lead automatically created from inbound WhatsApp message",
-                                metadata_={"wamid": msg.get("id")},
-                                created_at=now,
-                            )
-                            self.db.add(activity)
-                            action = "created"
-
-                        # Enqueue background outbox task for AI qualification
-                        await outbox_svc.enqueue_message(
-                            tenant_id=tenant.id,
-                            event_type="AI_QUALIFICATION_REQUESTED",
-                            aggregate_type="LEAD",
-                            aggregate_id=lead.id,
-                            payload={
-                                "message_text": text,
-                                "source": "WHATSAPP",
-                                "sender_phone": norm_phone,
-                            },
-                            idempotency_key=f"qual-{msg.get('id')}",
-                        )
-
-                        await self.db.flush()
+                            raise
 
                     processed_events.append({"action": action, "lead_id": str(lead.id)})
 

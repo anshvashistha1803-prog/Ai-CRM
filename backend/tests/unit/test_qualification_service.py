@@ -152,7 +152,10 @@ async def test_review_proposal_accept(mock_db):
     prop_res = MagicMock()
     prop_res.scalars.return_value.first.return_value = proposal
 
-    mock_db.execute.side_effect = [lead_res, lead_res, prop_res]
+    outbox_res = MagicMock()
+    outbox_res.scalars.return_value.first.return_value = None
+
+    mock_db.execute.side_effect = [lead_res, lead_res, prop_res, outbox_res]
 
     ctx = TenantContext(tenant_id=tenant_id, user_id=user_id, role=UserRole.MANAGER)
     svc = QualificationService(mock_db, ctx, llm_adapter=MockLLMAdapter())

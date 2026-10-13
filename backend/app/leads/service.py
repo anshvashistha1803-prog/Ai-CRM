@@ -118,6 +118,12 @@ class LeadService:
             notes=payload.notes,
             assigned_agent_id=assigned_agent_id,
             stage=LeadStage.NEW.value,
+            lead_health="UNKNOWN",
+            automation_status="ACTIVE",
+            do_not_contact=False,
+            is_deleted=False,
+            created_at=now,
+            updated_at=now,
             last_activity_at=now,
         )
 
@@ -281,81 +287,103 @@ class LeadService:
         now = datetime.now(UTC)
         changes: dict[str, Any] = {}
 
-        async with self.db.begin_nested() if self.db.in_transaction() else self.db.begin():
-            if payload.full_name is not None and payload.full_name != lead.full_name:
-                changes["full_name"] = {"from": lead.full_name, "to": payload.full_name}
-                lead.full_name = payload.full_name
+        try:
+            async with self.db.begin_nested() if self.db.in_transaction() else self.db.begin():
+                if payload.full_name is not None and payload.full_name != lead.full_name:
+                    changes["full_name"] = {"from": lead.full_name, "to": payload.full_name}
+                    lead.full_name = payload.full_name
 
-            if payload.phone is not None:
-                norm_phone = normalize_phone(payload.phone)
-                phone_hash = compute_blind_hash(norm_phone)
-                if phone_hash != lead.phone_hash:
-                    # Check duplicate within agency
-                    dup_stmt = select(Lead).where(
-                        Lead.tenant_id == self.context.tenant_id,
-                        Lead.phone_hash == phone_hash,
-                        Lead.id != lead.id,
-                        Lead.is_deleted.is_(False),
+                if payload.phone is not None:
+                    norm_phone = normalize_phone(payload.phone)
+                    phone_hash = compute_blind_hash(norm_phone)
+                    if phone_hash != lead.phone_hash:
+                        # Check duplicate within agency
+                        dup_stmt = select(Lead).where(
+                            Lead.tenant_id == self.context.tenant_id,
+                            Lead.phone_hash == phone_hash,
+                            Lead.id != lead.id,
+                            Lead.is_deleted.is_(False),
+                        )
+                        dup_res = await self.db.execute(dup_stmt)
+                        if dup_res.scalars().first():
+                            raise DuplicateLeadError("Another lead already has this phone number.")
+                        lead.phone_e164_enc = encrypt_field(norm_phone)
+                        lead.phone_hash = phone_hash
+                        changes["phone"] = "updated"
+
+                if payload.email is not None:
+                    norm_email = normalize_email(payload.email)
+                    email_hash = compute_blind_hash(norm_email)
+                    if email_hash != lead.email_hash:
+                        # Check duplicate within agency
+                        dup_stmt = select(Lead).where(
+                            Lead.tenant_id == self.context.tenant_id,
+                            Lead.email_hash == email_hash,
+                            Lead.id != lead.id,
+                            Lead.is_deleted.is_(False),
+                        )
+                        dup_res = await self.db.execute(dup_stmt)
+                        if dup_res.scalars().first():
+                            raise DuplicateLeadError("Another lead already has this email address.")
+                        lead.email_enc = encrypt_field(norm_email)
+                        lead.email_hash = email_hash
+                        changes["email"] = "updated"
+
+                for field in [
+                    "preferred_contact",
+                    "budget_min",
+                    "budget_max",
+                    "currency_code",
+                    "property_type",
+                    "bhk",
+                    "preferred_location",
+                    "purpose",
+                    "move_in_timeline",
+                    "notes",
+                    "assigned_agent_id",
+                    "do_not_contact",
+                ]:
+                    val = getattr(payload, field)
+                    if val is not None and getattr(lead, field) != val:
+                        changes[field] = {"from": getattr(lead, field), "to": val}
+                        setattr(lead, field, val)
+
+                if changes:
+                    lead.last_activity_at = now
+                    activity = LeadActivity(
+                        id=uuid.uuid4(),
+                        tenant_id=self.context.tenant_id,
+                        lead_id=lead.id,
+                        actor_id=self.context.user_id,
+                        actor_type="USER",
+                        activity_type="LEAD_UPDATED",
+                        description=f"Lead fields updated: {', '.join(changes.keys())}",
+                        metadata_={"changes": changes},
+                        created_at=now,
                     )
-                    dup_res = await self.db.execute(dup_stmt)
-                    if dup_res.scalars().first():
-                        raise DuplicateLeadError("Another lead already has this phone number.")
-                    lead.phone_e164_enc = encrypt_field(norm_phone)
-                    lead.phone_hash = phone_hash
-                    changes["phone"] = "updated"
+                    self.db.add(activity)
+                    await self.db.flush()
+        except IntegrityError as exc:
+            err_msg = str(exc).lower()
+            orig = getattr(exc, "orig", None)
+            sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
 
-            if payload.email is not None:
-                norm_email = normalize_email(payload.email)
-                email_hash = compute_blind_hash(norm_email)
-                if email_hash != lead.email_hash:
-                    # Check duplicate within agency
-                    dup_stmt = select(Lead).where(
-                        Lead.tenant_id == self.context.tenant_id,
-                        Lead.email_hash == email_hash,
-                        Lead.id != lead.id,
-                        Lead.is_deleted.is_(False),
-                    )
-                    dup_res = await self.db.execute(dup_stmt)
-                    if dup_res.scalars().first():
-                        raise DuplicateLeadError("Another lead already has this email address.")
-                    lead.email_enc = encrypt_field(norm_email)
-                    lead.email_hash = email_hash
-                    changes["email"] = "updated"
-
-            for field in [
-                "preferred_contact",
-                "budget_min",
-                "budget_max",
-                "currency_code",
-                "property_type",
-                "bhk",
-                "preferred_location",
-                "purpose",
-                "move_in_timeline",
-                "notes",
-                "assigned_agent_id",
-                "do_not_contact",
-            ]:
-                val = getattr(payload, field)
-                if val is not None and getattr(lead, field) != val:
-                    changes[field] = {"from": getattr(lead, field), "to": val}
-                    setattr(lead, field, val)
-
-            if changes:
-                lead.last_activity_at = now
-                activity = LeadActivity(
-                    id=uuid.uuid4(),
-                    tenant_id=self.context.tenant_id,
-                    lead_id=lead.id,
-                    actor_id=self.context.user_id,
-                    actor_type="USER",
-                    activity_type="LEAD_UPDATED",
-                    description=f"Lead fields updated: {', '.join(changes.keys())}",
-                    metadata_={"changes": changes},
-                    created_at=now,
-                )
-                self.db.add(activity)
-                await self.db.flush()
+            is_unique = (
+                sqlstate == "23505"
+                or "unique" in err_msg
+                or "duplicate" in err_msg
+            )
+            is_dedup_target = (
+                "phone" in err_msg
+                or "email" in err_msg
+                or "uq_leads" in err_msg
+                or "dedup" in err_msg
+            )
+            if is_unique and is_dedup_target:
+                raise DuplicateLeadError(
+                    "Another lead already has this contact information."
+                ) from exc
+            raise
 
         return self._to_response(lead)
 
@@ -413,19 +441,21 @@ class LeadService:
         """Enforce strict state machine transition rules and audit stage changes."""
         lead = await self._find_lead(lead_id)
 
+        from_stage = LeadStage(lead.stage) if isinstance(lead.stage, str) else lead.stage
+        to_stage = LeadStage(target_stage) if isinstance(target_stage, str) else target_stage
+
         # 1. State machine validation
         validate_transition(
-            current_stage=lead.stage,
-            target_stage=target_stage,
+            from_stage=from_stage,
+            to_stage=to_stage,
             actor_role=self.context.role,
             is_system=is_system,
         )
 
-        from_stage = lead.stage
         now = datetime.now(UTC)
 
         async with self.db.begin_nested() if self.db.in_transaction() else self.db.begin():
-            lead.stage = target_stage.value
+            lead.stage = to_stage.value
             lead.last_activity_at = now
 
             # 2. Activity timeline entry
@@ -436,10 +466,10 @@ class LeadService:
                 actor_id=self.context.user_id if not is_system else None,
                 actor_type="SYSTEM" if is_system else "USER",
                 activity_type="STAGE_CHANGED",
-                description=f"Stage transitioned from {from_stage} to {target_stage.value}",
+                description=f"Stage transitioned from {from_stage.value} to {to_stage.value}",
                 metadata_={
-                    "from_stage": from_stage,
-                    "to_stage": target_stage.value,
+                    "from_stage": from_stage.value,
+                    "to_stage": to_stage.value,
                     "reason": reason,
                 },
                 created_at=now,

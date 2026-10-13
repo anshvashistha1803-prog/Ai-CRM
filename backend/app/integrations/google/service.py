@@ -495,3 +495,191 @@ class GoogleIntegrationService:
 
         return InventoryStagingItemResponse.model_validate(item)
 
+    async def acquire_sync_lock(self, lock_ttl_seconds: int | None = None) -> str | None:
+        """
+        Attempt to acquire an exclusive, lease-backed synchronization lock for this tenant.
+        Uses row-level locking (SELECT ... FOR UPDATE) and lease metadata to prevent
+        overlapping manual and scheduled synchronization runs.
+
+        If a prior run crashed, the lease automatically expires after lock_ttl_seconds,
+        guaranteeing future runs are never permanently blocked.
+
+        Returns a unique lock token string on success, or None if already actively locked.
+        """
+        ttl = lock_ttl_seconds or settings.google_sheets_sync_lock_ttl_seconds
+        stmt = (
+            select(TenantGoogleIntegration)
+            .where(
+                TenantGoogleIntegration.tenant_id == self.tenant_id,
+                TenantGoogleIntegration.is_active.is_(True),
+                TenantGoogleIntegration.is_deleted.is_(False),
+            )
+            .with_for_update()
+        )
+        res = await self.db.execute(stmt)
+        integration = res.scalar_one_or_none()
+        if not integration or not integration.spreadsheet_id:
+            return None
+
+        now = datetime.now(UTC)
+        stats = dict(integration.last_sync_stats or {})
+        started_at_str = stats.get("sync_started_at")
+        existing_ttl = stats.get("sync_lock_ttl") or ttl
+
+        if integration.last_sync_status == "SYNCING" and started_at_str:
+            try:
+                started_at = datetime.fromisoformat(started_at_str)
+                if (now - started_at).total_seconds() < existing_ttl:
+                    logger.info(
+                        "google_sheets_sync_lock_active_skipped",
+                        tenant_id=str(self.tenant_id),
+                        elapsed_seconds=(now - started_at).total_seconds(),
+                    )
+                    return None
+                logger.warning(
+                    "google_sheets_sync_lock_expired_overriding",
+                    tenant_id=str(self.tenant_id),
+                    stale_started_at=started_at_str,
+                )
+            except Exception:
+                pass
+
+        token = uuid.uuid4().hex
+        integration.last_sync_status = "SYNCING"
+        stats["sync_started_at"] = now.isoformat()
+        stats["sync_lock_token"] = token
+        stats["sync_lock_ttl"] = ttl
+        integration.last_sync_stats = stats
+        await self.db.flush()
+        return token
+
+    async def renew_sync_lock(
+        self,
+        token: str,
+        lock_ttl_seconds: int | None = None,
+    ) -> bool:
+        """
+        Extend the synchronization lease heartbeat if the token matches and lease has not expired.
+        Updates sync_started_at to current UTC time while preserving all other last_sync_stats fields.
+        Returns True if successfully renewed, False if lease was lost, expired, or token mismatched.
+        """
+        ttl = lock_ttl_seconds or settings.google_sheets_sync_lock_ttl_seconds
+        stmt = (
+            select(TenantGoogleIntegration)
+            .where(
+                TenantGoogleIntegration.tenant_id == self.tenant_id,
+                TenantGoogleIntegration.is_active.is_(True),
+                TenantGoogleIntegration.is_deleted.is_(False),
+            )
+            .with_for_update()
+        )
+        res = await self.db.execute(stmt)
+        integration = res.scalar_one_or_none()
+        if not integration:
+            return False
+
+        stats = dict(integration.last_sync_stats or {})
+        current_token = stats.get("sync_lock_token")
+        if integration.last_sync_status != "SYNCING" or current_token != token:
+            logger.warning(
+                "google_sheets_sync_lock_renewal_denied_token_mismatch",
+                tenant_id=str(self.tenant_id),
+                expected_token=token,
+                actual_token=current_token,
+                status=integration.last_sync_status,
+            )
+            return False
+
+        now = datetime.now(UTC)
+        started_at_str = stats.get("sync_started_at")
+        existing_ttl = stats.get("sync_lock_ttl") or ttl
+        if started_at_str:
+            try:
+                started_at = datetime.fromisoformat(started_at_str)
+                # If the lease already expired beyond the TTL window, it cannot be renewed by the stale worker
+                if (now - started_at).total_seconds() >= existing_ttl:
+                    logger.warning(
+                        "google_sheets_sync_lock_renewal_denied_expired",
+                        tenant_id=str(self.tenant_id),
+                        elapsed_seconds=(now - started_at).total_seconds(),
+                        ttl=existing_ttl,
+                    )
+                    return False
+            except Exception:
+                pass
+
+        stats["sync_started_at"] = now.isoformat()
+        if lock_ttl_seconds:
+            stats["sync_lock_ttl"] = lock_ttl_seconds
+        integration.last_sync_stats = stats
+        await self.db.flush()
+        return True
+
+    async def release_sync_lock(
+        self,
+        token: str,
+        final_status: str = "SUCCESS",
+        error_message: str | None = None,
+        sync_stats: dict | None = None,
+    ) -> bool:
+        """
+        Release the synchronization lock if the provided token matches.
+        Updates last_sync_status, last_sync_at, and last_sync_stats atomically.
+        """
+        stmt = (
+            select(TenantGoogleIntegration)
+            .where(
+                TenantGoogleIntegration.tenant_id == self.tenant_id,
+                TenantGoogleIntegration.is_deleted.is_(False),
+            )
+            .with_for_update()
+        )
+        res = await self.db.execute(stmt)
+        integration = res.scalar_one_or_none()
+        if not integration:
+            return False
+
+        stats = dict(integration.last_sync_stats or {})
+        if stats.get("sync_lock_token") != token:
+            logger.warning(
+                "google_sheets_sync_lock_token_mismatch",
+                tenant_id=str(self.tenant_id),
+                expected=token,
+                actual=stats.get("sync_lock_token"),
+            )
+            return False
+
+        stats.pop("sync_lock_token", None)
+        stats.pop("sync_started_at", None)
+        stats.pop("sync_lock_ttl", None)
+        if sync_stats:
+            stats.update(sync_stats)
+
+        now = datetime.now(UTC)
+        integration.last_sync_status = final_status
+        integration.last_sync_stats = stats
+        integration.last_sync_at = now
+        if error_message:
+            integration.last_sync_error = error_message
+        elif final_status == "SUCCESS":
+            integration.last_sync_error = None
+
+        await self.db.flush()
+        return True
+
+    @classmethod
+    async def get_active_sync_tenant_ids(cls, db: AsyncSession) -> list[uuid.UUID]:
+        """Fetch all tenant IDs eligible for Google Sheets synchronization."""
+        stmt = (
+            select(TenantGoogleIntegration.tenant_id)
+            .where(
+                TenantGoogleIntegration.is_active.is_(True),
+                TenantGoogleIntegration.is_deleted.is_(False),
+                TenantGoogleIntegration.spreadsheet_id.isnot(None),
+            )
+            .order_by(TenantGoogleIntegration.created_at.asc())
+        )
+        res = await db.execute(stmt)
+        return list(res.scalars().all())
+
+

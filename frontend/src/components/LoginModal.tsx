@@ -134,17 +134,9 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onSuccess }) => {
               type="button"
               className="btn btn-secondary"
               style={{ fontSize: "0.75rem", padding: "4px 10px" }}
-              onClick={() => handleQuickFill("admin@apexrealty.com", "Password123!")}
+              onClick={() => handleQuickFill("manager@prestige.com", "PrestigeDev2026!")}
             >
-              Apex Admin
-            </button>
-            <button
-              type="button"
-              className="btn btn-secondary"
-              style={{ fontSize: "0.75rem", padding: "4px 10px" }}
-              onClick={() => handleQuickFill("agent@apexrealty.com", "SecurePassword123!")}
-            >
-              Agent Demo
+              Manager Demo
             </button>
           </div>
         </div>

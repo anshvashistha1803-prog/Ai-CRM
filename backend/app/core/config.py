@@ -104,6 +104,8 @@ class Settings(BaseSettings):
     google_sheets_credentials_json: str = ""
     google_sheets_spreadsheet_id: str = ""
     google_sheets_mode: Literal["real", "mock"] = "mock"
+    google_sheets_sync_interval_seconds: int = 3600
+    google_sheets_sync_lock_ttl_seconds: int = 600
 
     # ── Sentry ────────────────────────────────────────────────────────────────
     sentry_dsn: str = ""

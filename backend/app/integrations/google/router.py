@@ -191,10 +191,38 @@ async def sync_inventory_from_sheets(
     Restricted to MANAGER or higher roles.
     """
     context.require_role(UserRole.MANAGER)
-    sync_svc = PropertyInventorySyncService(db, context.tenant_id)
+    service = GoogleIntegrationService(db, context.tenant_id)
+    integration = await service.get_integration()
+    if not integration or not integration.spreadsheet_id:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Google Spreadsheet ID is not configured for this tenant.",
+        )
+
+    token = await service.acquire_sync_lock()
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A Google Sheets inventory synchronization is already in progress for this tenant.",
+        )
+
+    # Commit lease acquisition immediately so the row-level FOR UPDATE lock is released
+    # before external network operations to Google Sheets begin.
+    await db.commit()
+
+    sync_svc = PropertyInventorySyncService(db, context.tenant_id, lock_token=token)
     try:
-        return await sync_svc.sync_inventory()
+        res = await sync_svc.sync_inventory()
+        await service.release_sync_lock(token, final_status=res.status)
+        await db.commit()
+        return res
     except Exception as exc:
+        await db.rollback()
+        try:
+            await service.release_sync_lock(token, final_status="FAILED", error_message=str(exc))
+            await db.commit()
+        except Exception as release_exc:
+            logger.error("inventory_sync_release_lock_failed", error=str(release_exc))
         logger.error("inventory_sync_endpoint_error", tenant_id=str(context.tenant_id), error=str(exc))
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,

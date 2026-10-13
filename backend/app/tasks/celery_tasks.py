@@ -8,9 +8,11 @@ import uuid
 
 import structlog
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import get_settings
+from app.integrations.google.inventory_sync import PropertyInventorySyncService
+from app.integrations.google.service import GoogleIntegrationService
 from app.messaging.models import OutboxMessage
 from app.messaging.outbox_service import OutboxService
 from app.messaging.whatsapp_client import WhatsAppClient
@@ -26,7 +28,7 @@ def _get_async_session():
     return async_sessionmaker(engine, expire_on_commit=False)
 
 
-async def _handle_message_event(msg: OutboxMessage, db) -> str | None:
+async def _handle_message_event(msg: OutboxMessage, db: AsyncSession | None = None) -> str | None:
     """Route outbox message to its domain handler and return provider message ID if applicable."""
     logger.info(
         "processing_outbox_event",
@@ -48,28 +50,46 @@ async def _handle_message_event(msg: OutboxMessage, db) -> str | None:
 
         recipient = msg.payload.get("recipient_phone") if msg.payload else None
         text = msg.payload.get("message_text") if msg.payload else None
-        if recipient and text:
-            wa_client = WhatsAppClient()
-            res = await wa_client.send_text_message(recipient_phone=recipient, text=text)
-            messages = res.get("messages", [])
-            provider_id = messages[0].get("id") if messages else None
-            return provider_id
-        return None
+        if not recipient or not text:
+            raise ValueError("Missing recipient_phone or message_text in payload.")
+
+        wa_client = WhatsAppClient()
+        res = await wa_client.send_text_message(recipient_phone=recipient, text=text)
+        messages = res.get("messages", [])
+        provider_id = messages[0].get("id") if messages else None
+        if not provider_id:
+            raise RuntimeError(f"WhatsApp provider did not return message ID: {res}")
+        return provider_id
 
     elif msg.event_type == "AI_QUALIFICATION_REQUESTED":
         lead_id = uuid.UUID(msg.aggregate_id)
         text = msg.payload.get("message_text", "") if msg.payload else ""
         sender_phone = msg.payload.get("sender_phone") if msg.payload else None
         from app.qualification.conversation_service import QualificationConversationService
-        conv_svc = QualificationConversationService(db)
-        try:
-            await conv_svc.process_inbound_message(
-                lead_id=lead_id,
-                message_text=text,
-                sender_phone=sender_phone,
-            )
-        except Exception as exc:
-            logger.warning("ai_qualification_task_error", lead_id=str(lead_id), error=str(exc))
+
+        if db is not None:
+            conv_svc = QualificationConversationService(db)
+            try:
+                await conv_svc.process_inbound_message(
+                    lead_id=lead_id,
+                    message_text=text,
+                    sender_phone=sender_phone,
+                )
+            except Exception as exc:
+                logger.warning("ai_qualification_task_error", lead_id=str(lead_id), error=str(exc))
+        else:
+            session_factory = _get_async_session()
+            async with session_factory() as session:
+                conv_svc = QualificationConversationService(session)
+                try:
+                    await conv_svc.process_inbound_message(
+                        lead_id=lead_id,
+                        message_text=text,
+                        sender_phone=sender_phone,
+                    )
+                    await session.commit()
+                except Exception as exc:
+                    logger.warning("ai_qualification_task_error", lead_id=str(lead_id), error=str(exc))
         return None
 
     elif msg.event_type == "BROKER_HANDOFF_NOTIFICATION":
@@ -92,8 +112,14 @@ async def _handle_message_event(msg: OutboxMessage, db) -> str | None:
             is_read=False,
             sent_at=datetime.now(UTC),
         )
-        db.add(notif)
-        await db.flush()
+        if db is not None:
+            db.add(notif)
+            await db.flush()
+        else:
+            session_factory = _get_async_session()
+            async with session_factory() as session:
+                session.add(notif)
+                await session.commit()
         return None
 
     elif msg.event_type == "SHEETS_SYNC_REQUESTED":
@@ -128,38 +154,102 @@ async def _handle_message_event(msg: OutboxMessage, db) -> str | None:
         logger.info("dispatching_site_visit_notification", visit_id=visit_id)
         return None
 
+    elif msg.event_type == "MATCH_COMPUTATION_REQUESTED":
+        lead_id = uuid.UUID(msg.aggregate_id)
+        from app.core.dependencies import TenantContext, UserRole
+        from app.matching.service import MatchingService
+
+        context = TenantContext(
+            tenant_id=msg.tenant_id,
+            user_id=None,
+            role=UserRole.SUPER_ADMIN,
+        )
+
+        if db is not None:
+            matching_svc = MatchingService(db, context)
+            matches = await matching_svc.compute_matches_for_lead(lead_id)
+            logger.info(
+                "match_computation_completed",
+                lead_id=str(lead_id),
+                tenant_id=str(msg.tenant_id),
+                matches_count=len(matches),
+            )
+        else:
+            session_factory = _get_async_session()
+            async with session_factory() as session:
+                matching_svc = MatchingService(session, context)
+                matches = await matching_svc.compute_matches_for_lead(lead_id)
+                await session.commit()
+                logger.info(
+                    "match_computation_completed",
+                    lead_id=str(lead_id),
+                    tenant_id=str(msg.tenant_id),
+                    matches_count=len(matches),
+                )
+        return None
+
     else:
         logger.info("handled_generic_event", event_type=msg.event_type)
         return None
 
 
 async def _process_outbox_batch_async() -> int:
-    """Async implementation of outbox batch processor."""
+    """Async implementation of outbox batch processor with two-phase claim-and-process and OCC."""
     session_factory = _get_async_session()
     processed_count = 0
 
+    # Phase 1: Reclaim expired leases and atomically claim pending batch in a short transaction
+    claimed_msgs = []
     async with session_factory() as db:
         svc = OutboxService(db)
         await svc.reclaim_stale_processing_messages(lease_timeout_minutes=15)
+        claimed_msgs = await svc.claim_pending_messages(batch_size=50)
+        # Commit immediately so locks are released before any provider call
         await db.commit()
 
-        pending = await svc.fetch_pending_messages(batch_size=50)
+    if not claimed_msgs:
+        return 0
 
-        for msg in pending:
-            try:
-                await svc.mark_processing(msg.id)
-                provider_id = await _handle_message_event(msg, db)
-                await svc.mark_sent(msg.id, provider_message_id=provider_id)
-                processed_count += 1
-            except Exception as exc:
-                logger.error(
-                    "outbox_processing_failed",
-                    message_id=str(msg.id),
-                    error=str(exc),
+    # Phase 2: Process each claimed message independently without holding long-lived DB transactions
+    for msg in claimed_msgs:
+        claimed_at = msg.updated_at
+        claim_token = (msg.payload or {}).get("_claim_token")
+        try:
+            # External network calls execute without open DB transaction
+            provider_id = await _handle_message_event(msg, db=None)
+
+            async with session_factory() as db:
+                svc = OutboxService(db)
+                await svc.mark_sent(
+                    msg.id,
+                    provider_message_id=provider_id,
+                    claimed_at=claimed_at,
+                    claim_token=claim_token,
                 )
-                await svc.mark_failed(msg.id, error_message=str(exc))
-            finally:
                 await db.commit()
+            processed_count += 1
+        except Exception as exc:
+            logger.error(
+                "outbox_processing_failed",
+                message_id=str(msg.id),
+                error=str(exc),
+            )
+            try:
+                async with session_factory() as db:
+                    svc = OutboxService(db)
+                    await svc.mark_failed(
+                        msg.id,
+                        error_message=str(exc),
+                        claimed_at=claimed_at,
+                        claim_token=claim_token,
+                    )
+                    await db.commit()
+            except Exception as commit_exc:
+                logger.error(
+                    "outbox_mark_failed_commit_error",
+                    message_id=str(msg.id),
+                    error=str(commit_exc),
+                )
 
     return processed_count
 
@@ -219,37 +309,173 @@ async def _detect_stalled_leads_async() -> int:
     return stalled_count
 
 
-@celery_app.task(name="app.tasks.celery_tasks.process_outbox_batch")
+@celery_app.task(name="app.tasks.celery_tasks.process_outbox_batch", queue="messages")
 def process_outbox_batch() -> int:
     """Periodic Celery task: Poll and process pending outbox messages."""
     return asyncio.run(_process_outbox_batch_async())
 
 
-@celery_app.task(name="app.tasks.celery_tasks.detect_stalled_leads_batch")
+@celery_app.task(name="app.tasks.celery_tasks.detect_stalled_leads_batch", queue="default")
 def detect_stalled_leads_batch() -> int:
     """Periodic Celery task: Transition inactive leads to STALLED stage."""
     return asyncio.run(_detect_stalled_leads_async())
 
 
-@celery_app.task(name="app.tasks.celery_tasks.dispatch_outbox_message")
+@celery_app.task(name="app.tasks.celery_tasks.dispatch_outbox_message", queue="messages")
 def dispatch_outbox_message(message_id_str: str) -> bool:
-    """Immediately dispatch a specific outbox message."""
+    """Immediately dispatch a specific outbox message with atomic claim and OCC protection."""
     message_id = uuid.UUID(message_id_str)
 
     async def _dispatch():
         session_factory = _get_async_session()
+
+        # Phase 1: Atomically claim message if PENDING, releasing locks immediately
+        claimed_msg = None
         async with session_factory() as db:
             svc = OutboxService(db)
-            msg = await svc.get_message(message_id)
-            await svc.mark_processing(msg.id)
-            try:
-                provider_id = await _handle_message_event(msg, db)
-                await svc.mark_sent(msg.id, provider_message_id=provider_id)
-                await db.commit()
-                return True
-            except Exception as exc:
-                await svc.mark_failed(msg.id, error_message=str(exc))
-                await db.commit()
+            claimed_msg = await svc.claim_message(message_id)
+            if not claimed_msg:
+                logger.info("dispatch_outbox_message_already_claimed_or_processed", message_id=str(message_id))
                 return False
+            await db.commit()
+
+        claimed_at = claimed_msg.updated_at
+        claim_token = (claimed_msg.payload or {}).get("_claim_token")
+
+        # Phase 2: Provider call outside DB transaction
+        try:
+            provider_id = await _handle_message_event(claimed_msg, db=None)
+            async with session_factory() as db:
+                svc = OutboxService(db)
+                await svc.mark_sent(
+                    message_id,
+                    provider_message_id=provider_id,
+                    claimed_at=claimed_at,
+                    claim_token=claim_token,
+                )
+                await db.commit()
+            return True
+        except Exception as exc:
+            logger.error("dispatch_outbox_message_failed", message_id=str(message_id), error=str(exc))
+            try:
+                async with session_factory() as db:
+                    svc = OutboxService(db)
+                    await svc.mark_failed(
+                        message_id,
+                        error_message=str(exc),
+                        claimed_at=claimed_at,
+                        claim_token=claim_token,
+                    )
+                    await db.commit()
+            except Exception as commit_exc:
+                logger.error("dispatch_mark_failed_commit_error", message_id=str(message_id), error=str(commit_exc))
+            return False
 
     return asyncio.run(_dispatch())
+
+
+async def _sync_all_active_google_sheets_inventory_async() -> dict[str, int]:
+    """
+    Iterate across all active, eligible tenant Google integrations and execute
+    inventory synchronization with distributed lease locking and strict tenant isolation.
+    Failures for any individual tenant are caught and logged without affecting other tenants.
+    """
+    session_factory = _get_async_session()
+    async with session_factory() as db:
+        tenant_ids = await GoogleIntegrationService.get_active_sync_tenant_ids(db)
+
+    total_eligible = len(tenant_ids)
+    synced_full = 0
+    synced_partial = 0
+    failed_validation = 0
+    failed_infrastructure = 0
+    skipped_locked = 0
+
+    logger.info("google_sheets_scheduled_sync_batch_started", total_eligible=total_eligible)
+
+    for tenant_id in tenant_ids:
+        # Phase 1: Acquire lease-backed sync lock atomically
+        token = None
+        try:
+            async with session_factory() as db:
+                service = GoogleIntegrationService(db, tenant_id)
+                token = await service.acquire_sync_lock()
+                await db.commit()
+        except Exception as exc:
+            logger.error("google_sheets_sync_lock_acquisition_failed", tenant_id=str(tenant_id), error=str(exc))
+            failed_infrastructure += 1
+            continue
+
+        if not token:
+            logger.info("google_sheets_sync_skipped_locked", tenant_id=str(tenant_id))
+            skipped_locked += 1
+            continue
+
+        # Phase 2: Execute synchronization with isolated error boundary
+        try:
+            async with session_factory() as db:
+                sync_svc = PropertyInventorySyncService(db, tenant_id, lock_token=token)
+                res = await sync_svc.sync_inventory()
+                await db.commit()
+
+                # Release lock with outcome status
+                service = GoogleIntegrationService(db, tenant_id)
+                await service.release_sync_lock(token, final_status=res.status)
+                await db.commit()
+
+            if res.status == "SUCCESS":
+                synced_full += 1
+            elif res.status == "PARTIAL_SUCCESS":
+                synced_partial += 1
+            else:
+                failed_validation += 1
+
+            logger.info(
+                "google_sheets_sync_tenant_completed",
+                tenant_id=str(tenant_id),
+                status=res.status,
+                created=res.created,
+                updated=res.updated,
+                staged=res.staged,
+                errors=res.error_count,
+            )
+        except Exception as exc:
+            failed_infrastructure += 1
+            logger.error("google_sheets_sync_tenant_failed", tenant_id=str(tenant_id), error=str(exc))
+            try:
+                async with session_factory() as db:
+                    service = GoogleIntegrationService(db, tenant_id)
+                    await service.release_sync_lock(token, final_status="FAILED", error_message=str(exc))
+                    await db.commit()
+            except Exception as release_exc:
+                logger.error("google_sheets_sync_release_lock_failed", tenant_id=str(tenant_id), error=str(release_exc))
+
+    failed_total = failed_infrastructure + failed_validation
+    logger.info(
+        "google_sheets_scheduled_sync_batch_completed",
+        total_eligible=total_eligible,
+        synced=synced_full,
+        synced_full=synced_full,
+        synced_partial=synced_partial,
+        failed=failed_total,
+        failed_validation=failed_validation,
+        failed_infrastructure=failed_infrastructure,
+        skipped_locked=skipped_locked,
+    )
+    return {
+        "total_eligible": total_eligible,
+        "synced": synced_full,
+        "synced_full": synced_full,
+        "synced_partial": synced_partial,
+        "failed": failed_total,
+        "failed_validation": failed_validation,
+        "failed_infrastructure": failed_infrastructure,
+        "skipped_locked": skipped_locked,
+    }
+
+
+@celery_app.task(name="app.tasks.celery_tasks.sync_all_active_google_sheets_inventory", queue="default")
+def sync_all_active_google_sheets_inventory() -> dict[str, int]:
+    """Periodic Celery task: Synchronize Google Sheets inventory for all active tenants."""
+    return asyncio.run(_sync_all_active_google_sheets_inventory_async())
+

@@ -142,3 +142,56 @@ export interface SiteVisit {
   broker_confirmed: boolean;
   created_at: string;
 }
+
+export interface GoogleAuthorizeResponse {
+  authorization_url: string;
+  state: string;
+}
+
+export interface GoogleStatusResponse {
+  is_connected: boolean;
+  connected_at?: string | null;
+  connected_by?: string | null;
+  google_email?: string | null;
+  scopes: string[];
+  spreadsheet_id?: string | null;
+  properties_sheet_name: string;
+  incoming_leads_sheet_name?: string;
+  qualified_leads_sheet_name?: string;
+  column_mappings?: Record<string, any>;
+  sync_mode?: string;
+  last_sync_at?: string | null;
+  last_sync_status?: string | null;
+  last_sync_error?: string | null;
+  last_sync_stats?: Record<string, any>;
+}
+
+export interface GoogleConfigUpdateRequest {
+  spreadsheet_id?: string | null;
+  properties_sheet_name?: string | null;
+  incoming_leads_sheet_name?: string | null;
+  qualified_leads_sheet_name?: string | null;
+  column_mappings?: Record<string, any> | null;
+  sync_mode?: string | null;
+}
+
+export interface InventorySyncResponse {
+  status: string;
+  spreadsheet_id: string;
+  sheet_name: string;
+  total_rows: number;
+  created: number;
+  updated: number;
+  staged: number;
+  duplicate_suspects: number;
+  skipped: number;
+  error_count: number;
+  errors: Array<{
+    row?: number;
+    external_id?: string;
+    error?: string;
+    reason?: string;
+    field?: string;
+    [key: string]: any;
+  }>;
+}

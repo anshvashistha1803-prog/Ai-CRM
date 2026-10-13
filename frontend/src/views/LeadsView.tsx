@@ -15,14 +15,51 @@ import type { Lead, LeadActivity, LeadPropertyMatch, UserSummary } from "../type
 interface LeadsViewProps {
   leads: Lead[];
   teamUsers: UserSummary[];
+  currentUser?: UserSummary | null;
   onRefresh: () => void;
   openCreateModal: boolean;
   onCloseCreateModal: () => void;
 }
 
+function getAllowedTransitions(currentStage: string, role?: string): string[] {
+  const isManagerOrAdmin =
+    role === "MANAGER" || role === "AGENCY_ADMIN" || role === "SUPER_ADMIN";
+  switch (currentStage) {
+    case "NEW":
+      return isManagerOrAdmin
+        ? ["QUALIFYING", "DISQUALIFIED", "DO_NOT_CONTACT"]
+        : ["QUALIFYING", "DO_NOT_CONTACT"];
+    case "QUALIFYING":
+      return isManagerOrAdmin
+        ? ["QUALIFIED", "DISQUALIFIED", "DO_NOT_CONTACT"]
+        : ["QUALIFIED", "DO_NOT_CONTACT"];
+    case "QUALIFIED":
+      return isManagerOrAdmin
+        ? ["SITE_VISIT_SCHEDULED", "DISQUALIFIED", "DO_NOT_CONTACT"]
+        : ["SITE_VISIT_SCHEDULED", "DO_NOT_CONTACT"];
+    case "SITE_VISIT_SCHEDULED":
+      return isManagerOrAdmin
+        ? ["NEGOTIATION", "QUALIFIED", "DISQUALIFIED", "DO_NOT_CONTACT"]
+        : ["NEGOTIATION", "DO_NOT_CONTACT"];
+    case "NEGOTIATION":
+      return isManagerOrAdmin
+        ? ["WON", "LOST", "QUALIFIED", "SITE_VISIT_SCHEDULED", "DO_NOT_CONTACT"]
+        : ["WON", "LOST", "DO_NOT_CONTACT"];
+    case "LOST":
+      return isManagerOrAdmin ? ["QUALIFYING"] : [];
+    case "STALLED":
+      return isManagerOrAdmin
+        ? ["QUALIFYING", "QUALIFIED", "DISQUALIFIED", "DO_NOT_CONTACT"]
+        : ["DO_NOT_CONTACT"];
+    default:
+      return [];
+  }
+}
+
 export const LeadsView: React.FC<LeadsViewProps> = ({
   leads,
   teamUsers,
+  currentUser,
   onRefresh,
   openCreateModal,
   onCloseCreateModal,
@@ -300,7 +337,7 @@ export const LeadsView: React.FC<LeadsViewProps> = ({
                 <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
                   <h2 style={{ fontSize: "1.4rem" }}>{selectedLead.full_name}</h2>
                   <span className={`badge badge-${selectedLead.lead_health.toLowerCase()}`}>
-                    {selectedLead.lead_health} ({selectedLead.intent_score || 0})
+                    {selectedLead.lead_health} ({selectedLead.intent_score !== undefined && selectedLead.intent_score !== null ? selectedLead.intent_score : "Unscored"})
                   </span>
                   {selectedLead.do_not_contact && (
                     <span className="badge badge-danger">
@@ -337,24 +374,28 @@ export const LeadsView: React.FC<LeadsViewProps> = ({
                 <label style={{ fontSize: "0.75rem", color: "var(--text-muted)", display: "block", marginBottom: "4px" }}>
                   Stage State Machine
                 </label>
-                <select
-                  className="form-control"
-                  style={{ height: "36px", fontSize: "0.8125rem" }}
-                  value={selectedLead.stage}
-                  disabled={transitioning}
-                  onChange={(e) => handleStageTransition(e.target.value)}
-                >
-                  <option value="NEW">NEW</option>
-                  <option value="QUALIFYING">QUALIFYING</option>
-                  <option value="QUALIFIED">QUALIFIED</option>
-                  <option value="SITE_VISIT_SCHEDULED">SITE_VISIT_SCHEDULED</option>
-                  <option value="NEGOTIATION">NEGOTIATION</option>
-                  <option value="WON">WON</option>
-                  <option value="LOST">LOST</option>
-                  <option value="STALLED">STALLED</option>
-                  <option value="DISQUALIFIED">DISQUALIFIED</option>
-                  <option value="DO_NOT_CONTACT">DO_NOT_CONTACT</option>
-                </select>
+                {(() => {
+                  const allowedNext = getAllowedTransitions(selectedLead.stage, currentUser?.role);
+                  const isTerminal = allowedNext.length === 0;
+                  return (
+                    <select
+                      className="form-control"
+                      style={{ height: "36px", fontSize: "0.8125rem" }}
+                      value={selectedLead.stage}
+                      disabled={transitioning || isTerminal}
+                      onChange={(e) => handleStageTransition(e.target.value)}
+                    >
+                      <option value={selectedLead.stage}>
+                        {selectedLead.stage} {isTerminal ? "(Terminal)" : "(Current)"}
+                      </option>
+                      {allowedNext.map((st) => (
+                        <option key={st} value={st}>
+                          → {st}
+                        </option>
+                      ))}
+                    </select>
+                  );
+                })()}
               </div>
 
               <div style={{ flex: 1 }}>

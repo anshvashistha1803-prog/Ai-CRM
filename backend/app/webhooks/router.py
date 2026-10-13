@@ -46,7 +46,10 @@ async def receive_webhook(
     svc = WhatsAppWebhookService(db)
 
     # Verify HMAC signature
-    if x_hub_signature_256 and not svc.verify_signature(raw_body, x_hub_signature_256):
+    if not x_hub_signature_256:
+        raise HTTPException(status_code=401, detail="Missing X-Hub-Signature-256 header.")
+
+    if not svc.verify_signature(raw_body, x_hub_signature_256):
         raise HTTPException(status_code=403, detail="Invalid HMAC-SHA256 signature.")
 
     try:

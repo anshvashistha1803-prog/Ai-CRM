@@ -43,20 +43,25 @@ services:
     environment:
       - ENVIRONMENT=${ENVIRONMENT:-production}
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-crm_app}:${POSTGRES_PASSWORD:-crm_dev_password}@postgres:5432/${POSTGRES_DB:-crm_dev}
+      - DATABASE_URL_SYNC=postgresql+psycopg://${POSTGRES_USER:-crm_app}:${POSTGRES_PASSWORD:-crm_dev_password}@postgres:5432/${POSTGRES_DB:-crm_dev}
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/1
       - CELERY_RESULT_BACKEND=redis://redis:6379/2
-      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-change_me_super_secret_key_minimum_32_characters}
-      - JWT_ALGORITHM=HS256
-      - ACCESS_TOKEN_EXPIRE_MINUTES=60
-      - REFRESH_TOKEN_EXPIRE_DAYS=30
-      - FIELD_ENCRYPTION_KEY=${FIELD_ENCRYPTION_KEY:-e12720d58ba2541ee9989a19d20c3848b9fdf7d17730e6c5188f69e6b4f8d55a}
+      - SECRET_KEY=${SECRET_KEY:-change_me_super_secret_key_minimum_32_characters}
+      - APP_ENCRYPTION_KEY=${APP_ENCRYPTION_KEY:-e12720d58ba2541ee9989a19d20c3848b9fdf7d17730e6c5188f69e6b4f8d55a}
+      - JWT_ALGORITHM=RS256
+      - JWT_PRIVATE_KEY_PATH=${JWT_PRIVATE_KEY_PATH:-/app/keys/private.pem}
+      - JWT_PUBLIC_KEY_PATH=${JWT_PUBLIC_KEY_PATH:-/app/keys/public.pem}
+      - JWT_ACCESS_TOKEN_EXPIRE_MINUTES=${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-15}
+      - JWT_REFRESH_TOKEN_EXPIRE_DAYS=${JWT_REFRESH_TOKEN_EXPIRE_DAYS:-7}
       - LLM_PROVIDER=${LLM_PROVIDER:-mock}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - WHATSAPP_ACCESS_TOKEN=${WHATSAPP_ACCESS_TOKEN:-}
       - WHATSAPP_PHONE_NUMBER_ID=${WHATSAPP_PHONE_NUMBER_ID:-}
       - WHATSAPP_APP_SECRET=${WHATSAPP_APP_SECRET:-}
-      - WHATSAPP_WEBHOOK_VERIFY_TOKEN=${WHATSAPP_WEBHOOK_VERIFY_TOKEN:-crm_verify_token_secure}
+      - WHATSAPP_VERIFY_TOKEN=${WHATSAPP_VERIFY_TOKEN:-crm_verify_token_secure}
+    volumes:
+      - ./backend/keys:/app/keys:ro
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     depends_on:
@@ -80,13 +85,17 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/1
       - CELERY_RESULT_BACKEND=redis://redis:6379/2
-      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-change_me_super_secret_key_minimum_32_characters}
-      - FIELD_ENCRYPTION_KEY=${FIELD_ENCRYPTION_KEY:-e12720d58ba2541ee9989a19d20c3848b9fdf7d17730e6c5188f69e6b4f8d55a}
+      - SECRET_KEY=${SECRET_KEY:-change_me_super_secret_key_minimum_32_characters}
+      - APP_ENCRYPTION_KEY=${APP_ENCRYPTION_KEY:-e12720d58ba2541ee9989a19d20c3848b9fdf7d17730e6c5188f69e6b4f8d55a}
+      - JWT_ALGORITHM=RS256
+      - JWT_PUBLIC_KEY_PATH=${JWT_PUBLIC_KEY_PATH:-/app/keys/public.pem}
       - LLM_PROVIDER=${LLM_PROVIDER:-mock}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - WHATSAPP_ACCESS_TOKEN=${WHATSAPP_ACCESS_TOKEN:-}
       - WHATSAPP_PHONE_NUMBER_ID=${WHATSAPP_PHONE_NUMBER_ID:-}
       - WHATSAPP_APP_SECRET=${WHATSAPP_APP_SECRET:-}
+    volumes:
+      - ./backend/keys:/app/keys:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -106,7 +115,7 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/1
       - CELERY_RESULT_BACKEND=redis://redis:6379/2
-      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-change_me_super_secret_key_minimum_32_characters}
+      - SECRET_KEY=${SECRET_KEY:-change_me_super_secret_key_minimum_32_characters}
     depends_on:
       redis:
         condition: service_healthy

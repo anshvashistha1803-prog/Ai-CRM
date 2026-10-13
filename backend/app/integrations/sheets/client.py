@@ -6,6 +6,7 @@ Follows the Adapter pattern to isolate Google API dependencies and enable
 
 from typing import Any, Protocol, runtime_checkable
 
+import httpx
 import structlog
 
 logger = structlog.get_logger()
@@ -97,68 +98,72 @@ class MockGoogleSheetsClient:
 
 class OAuthGoogleSheetsClient:
     """
-    Production client connecting to Google Sheets API using an OAuth 2.0 access token.
+    Production client connecting to Google Sheets API using an OAuth 2.0 access token via httpx.
+    Eliminates dependency on synchronous google-api-python-client library.
     """
+
+    BASE_URL = "https://sheets.googleapis.com/v4/spreadsheets"
 
     def __init__(self, access_token: str) -> None:
         self.access_token = access_token
-        self._service = None
 
-    def _get_service(self):
-        if self._service is None:
-            from google.oauth2.credentials import Credentials
-            from googleapiclient.discovery import build
-
-            creds = Credentials(token=self.access_token)
-            self._service = build("sheets", "v4", credentials=creds, cache_discovery=False)
-        return self._service
+    def _get_headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+        }
 
     async def get_rows(self, spreadsheet_id: str, range_name: str) -> list[list[Any]]:
-        try:
-            service = self._get_service()
-            sheet = service.spreadsheets()
-            result = sheet.values().get(spreadsheetId=spreadsheet_id, range=range_name).execute()
-            return result.get("values", [])
-        except Exception as exc:
-            err_str = str(exc)
-            if "404" in err_str:
-                raise SpreadsheetNotFoundError(f"Spreadsheet not found: {spreadsheet_id}") from exc
-            if "403" in err_str or "Permission" in err_str:
-                raise SpreadsheetAccessError("Access denied to Google Spreadsheet. Check permissions.") from exc
-            raise GoogleSheetsClientError(f"Google Sheets API error: {err_str}") from exc
+        url = f"{self.BASE_URL}/{spreadsheet_id}/values/{range_name}"
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            try:
+                resp = await client.get(url, headers=self._get_headers())
+                if resp.status_code == 404:
+                    raise SpreadsheetNotFoundError(f"Spreadsheet not found: {spreadsheet_id}")
+                if resp.status_code in (401, 403):
+                    raise SpreadsheetAccessError(f"Access denied to Google Spreadsheet: {resp.text}")
+                if resp.status_code != 200:
+                    raise GoogleSheetsClientError(f"Google Sheets API error {resp.status_code}: {resp.text}")
+                data = resp.json()
+                return data.get("values", [])
+            except (SpreadsheetNotFoundError, SpreadsheetAccessError, GoogleSheetsClientError):
+                raise
+            except Exception as exc:
+                raise GoogleSheetsClientError(f"Network error accessing Google Sheets API: {exc}") from exc
 
     async def append_row(self, spreadsheet_id: str, range_name: str, values: list[Any]) -> int:
-        try:
-            service = self._get_service()
-            sheet = service.spreadsheets()
-            body = {"values": [values]}
-            result = sheet.values().append(
-                spreadsheetId=spreadsheet_id,
-                range=range_name,
-                valueInputOption="USER_ENTERED",
-                insertDataOption="INSERT_ROWS",
-                body=body,
-            ).execute()
-            updates = result.get("updates", {})
-            return updates.get("updatedRows", 1)
-        except Exception as exc:
-            raise GoogleSheetsClientError(f"Failed to append row: {exc}") from exc
+        url = f"{self.BASE_URL}/{spreadsheet_id}/values/{range_name}:append"
+        params = {"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"}
+        body = {"values": [values]}
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            try:
+                resp = await client.post(url, headers=self._get_headers(), params=params, json=body)
+                if resp.status_code != 200:
+                    raise GoogleSheetsClientError(f"Failed to append row ({resp.status_code}): {resp.text}")
+                data = resp.json()
+                updates = data.get("updates", {})
+                return updates.get("updatedRows", 1)
+            except GoogleSheetsClientError:
+                raise
+            except Exception as exc:
+                raise GoogleSheetsClientError(f"Network error appending to Google Sheet: {exc}") from exc
 
     async def update_row(self, spreadsheet_id: str, range_name: str, row_index: int, values: list[Any]) -> bool:
-        try:
-            service = self._get_service()
-            sheet = service.spreadsheets()
-            target_range = f"{range_name.split('!')[0]}!A{row_index}:{row_index}"
-            body = {"values": [values]}
-            sheet.values().update(
-                spreadsheetId=spreadsheet_id,
-                range=target_range,
-                valueInputOption="USER_ENTERED",
-                body=body,
-            ).execute()
-            return True
-        except Exception as exc:
-            raise GoogleSheetsClientError(f"Failed to update row: {exc}") from exc
+        sheet_part = range_name.split("!")[0] if "!" in range_name else range_name
+        target_range = f"{sheet_part}!A{row_index}:{row_index}"
+        url = f"{self.BASE_URL}/{spreadsheet_id}/values/{target_range}"
+        params = {"valueInputOption": "USER_ENTERED"}
+        body = {"values": [values]}
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            try:
+                resp = await client.put(url, headers=self._get_headers(), params=params, json=body)
+                if resp.status_code != 200:
+                    raise GoogleSheetsClientError(f"Failed to update row ({resp.status_code}): {resp.text}")
+                return True
+            except GoogleSheetsClientError:
+                raise
+            except Exception as exc:
+                raise GoogleSheetsClientError(f"Network error updating Google Sheet row: {exc}") from exc
 
 
 class RealGoogleSheetsClient:

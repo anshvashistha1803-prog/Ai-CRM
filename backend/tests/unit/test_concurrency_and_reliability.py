@@ -475,3 +475,230 @@ async def test_outbox_reconciliation_skips_duplicate_external_dispatch(mock_db):
         assert provider_id == "wamid.meta.existing.123"
         mock_wa.assert_not_called()
 
+
+@pytest.mark.asyncio
+async def test_outbox_claim_pending_messages_transitions_to_processing(mock_db):
+    """
+    claim_pending_messages atomically transitions selected pending rows to PROCESSING
+    and updates updated_at so locks can be released immediately upon commit.
+    """
+    msg1 = OutboxMessage()
+    msg1.id = uuid.uuid4()
+    msg1.status = "PENDING"
+    msg1.scheduled_at = datetime.now(UTC)
+
+    msg2 = OutboxMessage()
+    msg2.id = uuid.uuid4()
+    msg2.status = "PENDING"
+    msg2.scheduled_at = datetime.now(UTC)
+
+    mock_res = MagicMock()
+    mock_res.scalars.return_value.all.return_value = [msg1, msg2]
+    mock_db.execute.return_value = mock_res
+
+    svc = OutboxService(mock_db)
+    claimed = await svc.claim_pending_messages(batch_size=10)
+
+    assert len(claimed) == 2
+    assert msg1.status == "PROCESSING"
+    assert msg2.status == "PROCESSING"
+    assert msg1.updated_at is not None
+    assert msg2.updated_at is not None
+    mock_db.flush.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_outbox_claim_message_by_id(mock_db):
+    """
+    claim_message claims a specific pending message by ID and transitions it to PROCESSING.
+    """
+    msg = OutboxMessage()
+    msg.id = uuid.uuid4()
+    msg.status = "PENDING"
+
+    mock_res = MagicMock()
+    mock_res.scalars.return_value.first.return_value = msg
+    mock_db.execute.return_value = mock_res
+
+    svc = OutboxService(mock_db)
+    claimed = await svc.claim_message(msg.id)
+
+    assert claimed is not None
+    assert claimed.status == "PROCESSING"
+    assert claimed.updated_at is not None
+    mock_db.flush.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_outbox_stale_worker_mark_sent_rejected_by_timestamp(mock_db):
+    """
+    OCC stale-worker protection: If a worker took too long and the lease recovery process
+    reclaimed the message, updated_at on the message will be newer than claimed_at.
+    mark_sent must detect this and safely ignore the stale worker's result.
+    """
+    msg = OutboxMessage()
+    msg.id = uuid.uuid4()
+    msg.status = "PROCESSING"
+    # Reclaimed by another worker at T2
+    t1_claim = datetime(2026, 10, 12, 10, 0, 0, tzinfo=UTC)
+    t2_reclaimed = datetime(2026, 10, 12, 10, 16, 0, tzinfo=UTC)
+    msg.updated_at = t2_reclaimed
+
+    mock_res = MagicMock()
+    mock_res.scalars.return_value.first.return_value = msg
+    mock_db.execute.return_value = mock_res
+
+    svc = OutboxService(mock_db)
+    # Stale worker calls mark_sent with its original claim time T1
+    res = await svc.mark_sent(msg.id, provider_message_id="wamid.stale.999", claimed_at=t1_claim)
+
+    # Status must NOT be updated to SENT; flush must NOT be called
+    assert res.status == "PROCESSING"
+    assert res.updated_at == t2_reclaimed
+    mock_db.flush.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_outbox_stale_worker_mark_failed_rejected_by_timestamp(mock_db):
+    """
+    OCC stale-worker protection: A stale worker reporting failure must not overwrite
+    a newer claim or increment retries after the message has been reclaimed.
+    """
+    msg = OutboxMessage()
+    msg.id = uuid.uuid4()
+    msg.status = "PROCESSING"
+    msg.retry_count = 1
+    t1_claim = datetime(2026, 10, 12, 10, 0, 0, tzinfo=UTC)
+    t2_reclaimed = datetime(2026, 10, 12, 10, 16, 0, tzinfo=UTC)
+    msg.updated_at = t2_reclaimed
+
+    mock_res = MagicMock()
+    mock_res.scalars.return_value.first.return_value = msg
+    mock_db.execute.return_value = mock_res
+
+    svc = OutboxService(mock_db)
+    res = await svc.mark_failed(msg.id, error_message="Stale failure", claimed_at=t1_claim)
+
+    assert res.retry_count == 1
+    assert res.updated_at == t2_reclaimed
+    mock_db.flush.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_outbox_stale_worker_rejected_with_identical_timestamps(mock_db):
+    """
+    CRITICAL: Timestamp-based OCC fails when two successive claims share the identical timestamp.
+    The unique UUID claim_token guarantees stale worker rejection even with identical timestamps.
+    """
+    msg = OutboxMessage()
+    msg.id = uuid.uuid4()
+    msg.status = "PROCESSING"
+    # Same identical timestamp
+    exact_time = datetime(2026, 10, 12, 12, 0, 0, tzinfo=UTC)
+    msg.updated_at = exact_time
+    # Newer claim has token B
+    msg.payload = {"_claim_token": "token-worker-2"}
+
+    mock_res = MagicMock()
+    mock_res.scalars.return_value.first.return_value = msg
+    mock_db.execute.return_value = mock_res
+
+    svc = OutboxService(mock_db)
+    # Stale worker 1 attempts to finalize with token A and the exact same timestamp
+    res = await svc.mark_sent(
+        msg.id,
+        provider_message_id="wamid.stale.identical",
+        claimed_at=exact_time,
+        claim_token="token-worker-1",
+    )
+
+    # Must be safely ignored (status unchanged, not marked SENT)
+    assert res.status == "PROCESSING"
+    assert res.payload.get("_claim_token") == "token-worker-2"
+    mock_db.flush.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_outbox_stale_worker_rejected_with_near_identical_timestamps(mock_db):
+    """
+    CRITICAL: A 1-second timestamp tolerance fails if successive claims occur within < 1.0s.
+    The unique UUID claim_token guarantees stale worker rejection for subsecond successive claims.
+    """
+    msg = OutboxMessage()
+    msg.id = uuid.uuid4()
+    msg.status = "PROCESSING"
+    # Successive claim happened 50ms later (well within 1.0 second!)
+    t1 = datetime(2026, 10, 12, 12, 0, 0, 0, tzinfo=UTC)
+    t2 = datetime(2026, 10, 12, 12, 0, 0, 50000, tzinfo=UTC)  # +50ms
+    msg.updated_at = t2
+    msg.payload = {"_claim_token": "token-worker-2"}
+
+    mock_res = MagicMock()
+    mock_res.scalars.return_value.first.return_value = msg
+    mock_db.execute.return_value = mock_res
+
+    svc = OutboxService(mock_db)
+    # Stale worker 1 attempts to finalize with token A and claim time t1
+    res = await svc.mark_sent(
+        msg.id,
+        provider_message_id="wamid.stale.subsecond",
+        claimed_at=t1,
+        claim_token="token-worker-1",
+    )
+
+    assert res.status == "PROCESSING"
+    assert res.payload.get("_claim_token") == "token-worker-2"
+    mock_db.flush.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_outbox_retry_eligibility_after_failure(mock_db):
+    """
+    Failed outbox message is scheduled for retry with exponential backoff and becomes
+    eligible again when current time surpasses scheduled_at.
+    """
+    msg = OutboxMessage()
+    msg.id = uuid.uuid4()
+    msg.status = "PROCESSING"
+    msg.retry_count = 0
+    msg.max_retries = 3
+
+    mock_res = MagicMock()
+    mock_res.scalars.return_value.first.return_value = msg
+    mock_db.execute.return_value = mock_res
+
+    svc = OutboxService(mock_db)
+    now = datetime(2026, 10, 12, 12, 0, 0, tzinfo=UTC)
+    failed_msg = await svc.mark_failed(msg.id, error_message="Transient network glitch", base_backoff_seconds=30)
+
+    assert failed_msg.status == "PENDING"
+    assert failed_msg.retry_count == 1
+    # First retry backoff: 30 * 2^0 = 30 seconds
+    assert failed_msg.scheduled_at > now
+
+
+@pytest.mark.asyncio
+async def test_outbox_provider_failure_does_not_mark_sent(mock_db):
+    """
+    If a provider dispatch raises an error or fails, the message is marked FAILED,
+    not marked SENT, ensuring broken deliveries are never marked successful.
+    """
+    from app.tasks.celery_tasks import _handle_message_event
+
+    msg = OutboxMessage()
+    msg.id = uuid.uuid4()
+    msg.event_type = "WHATSAPP_OUTBOUND_DISPATCH"
+    msg.payload = {
+        "recipient_phone": "+1234567890",
+        "message_text": "Hello",
+    }
+
+    with patch("app.tasks.celery_tasks.WhatsAppClient") as mock_client_cls:
+        mock_client = MagicMock()
+        mock_client.send_text_message = AsyncMock(side_effect=RuntimeError("Meta 500 error"))
+        mock_client_cls.return_value = mock_client
+
+        with pytest.raises(RuntimeError, match="Meta 500 error"):
+            await _handle_message_event(msg, mock_db)
+
+

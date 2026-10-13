@@ -161,10 +161,17 @@ class SiteVisitService:
             )
             self.db.add(visit)
 
-            # Advance lead stage to SITE_VISIT_SCHEDULED if in QUALIFIED
-            if lead.stage in (LeadStage.QUALIFIED.value, LeadStage.NEW.value, LeadStage.QUALIFYING.value):
-                lead.stage = LeadStage.SITE_VISIT_SCHEDULED.value
-
+            # Advance lead stage to SITE_VISIT_SCHEDULED via state machine validation
+            from app.leads.state_machine import validate_transition
+            from_stage = LeadStage(lead.stage) if isinstance(lead.stage, str) else lead.stage
+            to_stage = LeadStage.SITE_VISIT_SCHEDULED
+            validate_transition(
+                from_stage=from_stage,
+                to_stage=to_stage,
+                actor_role=self.context.role,
+                is_system=False,
+            )
+            lead.stage = to_stage.value
             lead.last_activity_at = now
 
             activity = LeadActivity(
@@ -332,10 +339,19 @@ class SiteVisitService:
             other_active = await self.db.execute(other_active_stmt)
 
             if not other_active.scalars().first():
-                # Revert lead stage back to QUALIFIED
+                # Revert lead stage back to QUALIFIED via state machine
                 lead = await self._find_and_authorize_lead(visit.lead_id)
                 if lead.stage == LeadStage.SITE_VISIT_SCHEDULED.value:
-                    lead.stage = LeadStage.QUALIFIED.value
+                    from app.leads.state_machine import validate_transition
+                    from_stage = LeadStage(lead.stage) if isinstance(lead.stage, str) else lead.stage
+                    to_stage = LeadStage.QUALIFIED
+                    validate_transition(
+                        from_stage=from_stage,
+                        to_stage=to_stage,
+                        actor_role=self.context.role,
+                        is_system=True,
+                    )
+                    lead.stage = to_stage.value
                     lead.last_activity_at = now
 
             activity = LeadActivity(

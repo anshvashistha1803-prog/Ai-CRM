@@ -6,6 +6,7 @@ import {
   Building2,
   CalendarCheck,
   UserCheck,
+  FileSpreadsheet,
   LogOut,
   Building,
 } from "lucide-react";
@@ -33,6 +34,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     { id: "properties", label: "Properties", icon: Building2 },
     { id: "visits", label: "Site Visits", icon: CalendarCheck },
     { id: "team", label: "Agency Team", icon: UserCheck },
+    { id: "integrations", label: "Google Sheets", icon: FileSpreadsheet },
   ];
 
   return (

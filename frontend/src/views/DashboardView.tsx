@@ -17,7 +17,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onNavigate,
   onOpenNewLead,
 }) => {
-  const hotLeads = leads.filter((l) => l.lead_health === "HOT" || (l.intent_score && l.intent_score >= 70));
+  const hotLeads = leads.filter(
+    (l) => l.lead_health === "HOT" || (l.intent_score !== undefined && l.intent_score !== null && l.intent_score >= 70)
+  );
   const activeVisits = visits.filter((v) => v.status === "SCHEDULED" || v.status === "CONFIRMED");
   const availableProps = properties.filter((p) => p.status === "AVAILABLE");
 
@@ -26,34 +28,56 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     stageCounts[l.stage] = (stageCounts[l.stage] || 0) + 1;
   });
 
+  const [mountTime] = React.useState(() => Date.now());
+  const { newThisWeek, nextVisitText } = React.useMemo(() => {
+    const sevenDaysAgo = mountTime - 7 * 24 * 60 * 60 * 1000;
+    const countNew = leads.filter((l) => {
+      const created = new Date(l.created_at).getTime();
+      return !isNaN(created) && created >= sevenDaysAgo;
+    }).length;
+
+    const upcomingVisits = activeVisits
+      .map((v) => new Date(v.scheduled_start_at))
+      .filter((d) => !isNaN(d.getTime()) && d.getTime() >= mountTime)
+      .sort((a, b) => a.getTime() - b.getTime());
+
+    const nextText = upcomingVisits.length > 0
+      ? `Next: ${upcomingVisits[0].toLocaleDateString(undefined, { month: "short", day: "numeric" })}`
+      : (activeVisits.length > 0 ? "Dates pending" : "No visits scheduled");
+
+    return { newThisWeek: countNew, nextVisitText: nextText };
+  }, [leads, activeVisits, mountTime]);
+
   const cards = [
     {
       title: "Total Leads",
       value: leads.length,
       icon: Users,
       color: "var(--accent-primary)",
-      trend: "+14% this week",
+      trend: `${newThisWeek} new in last 7 days`,
     },
     {
       title: "Hot Prospects",
       value: hotLeads.length,
       icon: Flame,
       color: "#f59e0b",
-      trend: "High conversion probability",
+      trend: leads.length > 0
+        ? `${Math.round((hotLeads.length / leads.length) * 100)}% of pipeline`
+        : "None identified",
     },
     {
       title: "Site Visits Scheduled",
       value: activeVisits.length,
       icon: Calendar,
       color: "var(--color-info)",
-      trend: "Next: tomorrow",
+      trend: nextVisitText,
     },
     {
       title: "Available Properties",
       value: availableProps.length,
       icon: Building,
       color: "var(--color-success)",
-      trend: "Active inventory",
+      trend: `${availableProps.length} of ${properties.length} active`,
     },
   ];
 
@@ -202,7 +226,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   </div>
                   <div style={{ textAlign: "right" }}>
                     <span className="badge badge-hot">
-                      Score: {lead.intent_score || 85}
+                      {lead.intent_score !== undefined && lead.intent_score !== null
+                        ? `Score: ${lead.intent_score}`
+                        : "Score: N/A"}
                     </span>
                     <div style={{ fontSize: "0.7rem", color: "var(--text-muted)", marginTop: "2px" }}>
                       {lead.stage}

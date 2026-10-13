@@ -130,6 +130,10 @@ class OutboxService:
             msg.retry_count += 1
             msg.last_error = f"Worker lease expired (processing stuck for >{lease_timeout_minutes}m)"
             msg.updated_at = current_time
+            # Invalidate claim token so stale worker cannot finalize
+            updated_payload = dict(msg.payload) if msg.payload else {}
+            updated_payload["_claim_token"] = None
+            msg.payload = updated_payload
             if msg.retry_count >= msg.max_retries:
                 msg.status = "DEAD_LETTER"
                 msg.processed_at = current_time
@@ -143,6 +147,64 @@ class OutboxService:
             logger.warning("stale_outbox_messages_reclaimed", count=reclaimed_count)
 
         return reclaimed_count
+
+    async def claim_pending_messages(
+        self,
+        batch_size: int = 50,
+        now: datetime | None = None,
+    ) -> Sequence[OutboxMessage]:
+        """
+        Atomically fetch pending messages due for processing and transition them to PROCESSING.
+        Uses FOR UPDATE SKIP LOCKED to prevent duplicate claiming across workers.
+        Assigns a unique UUID claim token for reliable stale-worker rejection without migrations.
+        """
+        current_time = now or datetime.now(UTC)
+        messages = await self.fetch_pending_messages(
+            batch_size=batch_size,
+            now=current_time,
+            lock_rows=True,
+        )
+        for msg in messages:
+            msg.status = "PROCESSING"
+            msg.updated_at = current_time
+            updated_payload = dict(msg.payload) if msg.payload else {}
+            updated_payload["_claim_token"] = str(uuid.uuid4())
+            msg.payload = updated_payload
+        if messages:
+            await self.db.flush()
+        return messages
+
+    async def claim_message(
+        self,
+        message_id: uuid.UUID,
+        now: datetime | None = None,
+    ) -> OutboxMessage | None:
+        """
+        Atomically claim a specific pending message for processing.
+        Uses FOR UPDATE SKIP LOCKED. Returns None if already claimed or processed.
+        Assigns a unique UUID claim token for reliable stale-worker rejection without migrations.
+        """
+        current_time = now or datetime.now(UTC)
+        stmt = (
+            select(OutboxMessage)
+            .where(
+                OutboxMessage.id == message_id,
+                OutboxMessage.status == "PENDING",
+            )
+            .with_for_update(skip_locked=True)
+        )
+        res = await self.db.execute(stmt)
+        msg = res.scalars().first()
+        if not msg:
+            return None
+
+        msg.status = "PROCESSING"
+        msg.updated_at = current_time
+        updated_payload = dict(msg.payload) if msg.payload else {}
+        updated_payload["_claim_token"] = str(uuid.uuid4())
+        msg.payload = updated_payload
+        await self.db.flush()
+        return msg
 
     async def get_message(self, message_id: uuid.UUID) -> OutboxMessage:
         """Retrieve an outbox message by ID."""
@@ -166,8 +228,13 @@ class OutboxService:
         self,
         message_id: uuid.UUID,
         provider_message_id: str | None = None,
+        claimed_at: datetime | None = None,
+        claim_token: str | None = None,
     ) -> OutboxMessage:
-        """Mark outbox message as successfully delivered / processed."""
+        """
+        Mark outbox message as successfully delivered / processed.
+        Guards against stale workers via unique claim_token and/or claimed_at timestamp.
+        """
         now = datetime.now(UTC)
         msg = await self.get_message(message_id)
         if msg.status != "PROCESSING":
@@ -179,13 +246,39 @@ class OutboxService:
             )
             return msg
 
+        # Primary OCC verification: unique UUID claim token
+        if claim_token is not None:
+            current_token = (msg.payload or {}).get("_claim_token")
+            if current_token != claim_token:
+                logger.warning(
+                    "outbox_claim_token_mismatch",
+                    message_id=str(msg.id),
+                    expected_token=claim_token,
+                    current_token=current_token,
+                    action="mark_sent_ignored",
+                )
+                return msg
+        elif claimed_at is not None and msg.updated_at is not None:
+            # Fallback timestamp comparison if claim_token is not provided
+            if abs(msg.updated_at.timestamp() - claimed_at.timestamp()) > 1.0:
+                logger.warning(
+                    "outbox_claim_expired_or_overwritten",
+                    message_id=str(msg.id),
+                    claimed_at=claimed_at.isoformat(),
+                    current_updated_at=msg.updated_at.isoformat(),
+                    action="mark_sent_ignored",
+                )
+                return msg
+
         msg.status = "SENT"
         msg.processed_at = now
         msg.updated_at = now
+        updated_payload = dict(msg.payload) if msg.payload else {}
         if provider_message_id:
-            updated_payload = dict(msg.payload) if msg.payload else {}
             updated_payload["provider_message_id"] = provider_message_id
-            msg.payload = updated_payload
+        # Clear claim token on completion
+        updated_payload.pop("_claim_token", None)
+        msg.payload = updated_payload
 
         await self.db.flush()
 
@@ -202,11 +295,14 @@ class OutboxService:
         self,
         message_id: uuid.UUID,
         error_message: str,
+        claimed_at: datetime | None = None,
+        claim_token: str | None = None,
         base_backoff_seconds: int = 30,
     ) -> OutboxMessage:
         """
         Record failure, increment retry count, and schedule next retry with exponential backoff.
         Moves to DEAD_LETTER if max_retries is reached.
+        Guards against stale workers via unique claim_token and/or claimed_at timestamp.
         """
         now = datetime.now(UTC)
         msg = await self.get_message(message_id)
@@ -219,9 +315,36 @@ class OutboxService:
             )
             return msg
 
+        # Primary OCC verification: unique UUID claim token
+        if claim_token is not None:
+            current_token = (msg.payload or {}).get("_claim_token")
+            if current_token != claim_token:
+                logger.warning(
+                    "outbox_claim_token_mismatch",
+                    message_id=str(msg.id),
+                    expected_token=claim_token,
+                    current_token=current_token,
+                    action="mark_failed_ignored",
+                )
+                return msg
+        elif claimed_at is not None and msg.updated_at is not None:
+            # Fallback timestamp comparison if claim_token is not provided
+            if abs(msg.updated_at.timestamp() - claimed_at.timestamp()) > 1.0:
+                logger.warning(
+                    "outbox_claim_expired_or_overwritten",
+                    message_id=str(msg.id),
+                    claimed_at=claimed_at.isoformat(),
+                    current_updated_at=msg.updated_at.isoformat(),
+                    action="mark_failed_ignored",
+                )
+                return msg
+
         msg.retry_count += 1
         msg.last_error = error_message
         msg.updated_at = now
+        updated_payload = dict(msg.payload) if msg.payload else {}
+        updated_payload.pop("_claim_token", None)
+        msg.payload = updated_payload
 
         if msg.retry_count >= msg.max_retries:
             msg.status = "DEAD_LETTER"

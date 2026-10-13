@@ -10,9 +10,11 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     SmallInteger,
     String,
     Text,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -29,6 +31,15 @@ class Lead(Base, UUIDPrimaryKeyMixin, TenantMixin, TimestampMixin, SoftDeleteMix
     """
 
     __tablename__ = "leads"
+    __table_args__ = (
+        Index(
+            "uq_leads_tenant_phone_hash",
+            "tenant_id",
+            "phone_hash",
+            unique=True,
+            postgresql_where=text("is_deleted IS FALSE AND phone_hash IS NOT NULL"),
+        ),
+    )
 
     # Inbound channel
     external_id: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)

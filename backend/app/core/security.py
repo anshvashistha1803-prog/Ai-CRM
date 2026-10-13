@@ -186,12 +186,15 @@ def compute_blind_hash(value: str | None) -> str | None:
 
 
 # ── HMAC verification (WhatsApp webhook) ──────────────────────────────────────
-def verify_whatsapp_signature(payload_bytes: bytes, signature_header: str) -> bool:
+def verify_whatsapp_signature(payload_bytes: bytes, signature_header: str | None) -> bool:
     """
     Verify X-Hub-Signature-256 header from Meta.
     Uses constant-time comparison to prevent timing attacks.
+    Fails closed if secret is not configured or header is invalid.
     """
-    if not signature_header.startswith("sha256="):
+    if not settings.whatsapp_app_secret:
+        return False
+    if not signature_header or not signature_header.startswith("sha256="):
         return False
     expected = signature_header[len("sha256="):]
     actual = hmac.new(

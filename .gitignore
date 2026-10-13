@@ -1,6 +1,12 @@
 # AI Real Estate CRM
 
 .env
+.env.*
+!.env.example
+backend/.env
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
 *.pyc
 __pycache__/
 .venv/
@@ -13,6 +19,13 @@ build/
 htmlcov/
 .coverage
 coverage.xml
+
+# Celery Beat runtime files
+backend/celerybeat-schedule*
+celerybeat-schedule*
+
+# Scratch and test run artifacts
+scratch/
 
 # Keys (never commit private keys)
 backend/keys/

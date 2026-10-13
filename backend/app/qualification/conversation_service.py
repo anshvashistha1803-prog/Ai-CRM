@@ -744,6 +744,21 @@ class QualificationConversationService:
                 idempotency_key=f"ai-reply-final-{lead.id}",
             )
 
+        # 8. Outbox: Idempotent Automatic Property Matching Request
+        await outbox_svc.enqueue_message(
+            tenant_id=lead.tenant_id,
+            event_type="MATCH_COMPUTATION_REQUESTED",
+            aggregate_type="LEAD",
+            aggregate_id=lead.id,
+            payload={
+                "lead_id": str(lead.id),
+                "intent": intent,
+                "score": score_out.intent_score,
+                "health": score_out.lead_health,
+            },
+            idempotency_key=f"match-compute-{lead.id}",
+        )
+
         await self.db.flush()
 
         logger.info(

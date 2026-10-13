@@ -8,6 +8,7 @@ import { ProposalsView } from "./views/ProposalsView";
 import { PropertiesView } from "./views/PropertiesView";
 import { VisitsView } from "./views/VisitsView";
 import { TeamView } from "./views/TeamView";
+import { GoogleIntegrationView } from "./views/GoogleIntegrationView";
 import { api } from "./api";
 import type { Lead, Property, SiteVisit, UserSummary, TenantInfo } from "./types";
 
@@ -120,6 +121,7 @@ export function App() {
             <LeadsView
               leads={leads}
               teamUsers={teamUsers}
+              currentUser={currentUser}
               onRefresh={refreshAllData}
               openCreateModal={openCreateLead}
               onCloseCreateModal={() => setOpenCreateLead(false)}
@@ -155,6 +157,14 @@ export function App() {
               teamUsers={teamUsers}
               agency={agency}
               onRefresh={refreshAllData}
+            />
+          )}
+
+          {currentView === "integrations" && (
+            <GoogleIntegrationView
+              currentUser={currentUser}
+              agency={agency}
+              onInventorySynced={refreshAllData}
             />
           )}
         </main>

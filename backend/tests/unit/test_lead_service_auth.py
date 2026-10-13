@@ -364,3 +364,113 @@ class TestTransactionCorrectnessAndRollback:
         update_payload = LeadUpdateRequest(phone="+919999999999")
         with pytest.raises(DuplicateLeadError, match="Another lead already has this phone number"):
             await service.update_lead(target_lead.id, update_payload)
+
+
+@pytest.mark.asyncio
+class TestLeadStageTransitions:
+    """Tests covering LeadService.transition_stage state machine enforcement."""
+
+    async def test_agent_valid_transition_new_to_qualifying(self, mock_db, tenant_a, agent_1_id):
+        lead = _create_mock_lead(tenant_id=tenant_a, assigned_agent_id=agent_1_id)
+        lead.stage = "NEW"
+
+        find_res = MagicMock()
+        find_res.scalars.return_value.first.return_value = lead
+        mock_db.execute.return_value = find_res
+
+        context = TenantContext(user_id=agent_1_id, tenant_id=tenant_a, role=UserRole.AGENT)
+        service = LeadService(mock_db, context)
+
+        from app.leads.state_machine import LeadStage
+        res = await service.transition_stage(lead.id, LeadStage.QUALIFYING, reason="Started WhatsApp conversation")
+
+        assert res.stage == "QUALIFYING"
+        assert lead.stage == "QUALIFYING"
+        assert mock_db.add.called
+        mock_db.flush.assert_awaited()
+
+    async def test_agent_skip_stage_rejected(self, mock_db, tenant_a, agent_1_id):
+        lead = _create_mock_lead(tenant_id=tenant_a, assigned_agent_id=agent_1_id)
+        lead.stage = "NEW"
+
+        find_res = MagicMock()
+        find_res.scalars.return_value.first.return_value = lead
+        mock_db.execute.return_value = find_res
+
+        context = TenantContext(user_id=agent_1_id, tenant_id=tenant_a, role=UserRole.AGENT)
+        service = LeadService(mock_db, context)
+
+        from app.core.exceptions import InvalidTransitionError
+        from app.leads.state_machine import LeadStage
+
+        with pytest.raises(InvalidTransitionError, match="not permitted"):
+            await service.transition_stage(lead.id, LeadStage.WON)
+
+    async def test_agent_disqualify_rejected_requires_manager(self, mock_db, tenant_a, agent_1_id):
+        lead = _create_mock_lead(tenant_id=tenant_a, assigned_agent_id=agent_1_id)
+        lead.stage = "QUALIFYING"
+
+        find_res = MagicMock()
+        find_res.scalars.return_value.first.return_value = lead
+        mock_db.execute.return_value = find_res
+
+        context = TenantContext(user_id=agent_1_id, tenant_id=tenant_a, role=UserRole.AGENT)
+        service = LeadService(mock_db, context)
+
+        from app.core.exceptions import InvalidTransitionError
+        from app.leads.state_machine import LeadStage
+
+        with pytest.raises(InvalidTransitionError, match="requires MANAGER role"):
+            await service.transition_stage(lead.id, LeadStage.DISQUALIFIED)
+
+    async def test_manager_disqualify_allowed(self, mock_db, tenant_a):
+        lead = _create_mock_lead(tenant_id=tenant_a)
+        lead.stage = "QUALIFYING"
+
+        find_res = MagicMock()
+        find_res.scalars.return_value.first.return_value = lead
+        mock_db.execute.return_value = find_res
+
+        context = TenantContext(user_id=uuid.uuid4(), tenant_id=tenant_a, role=UserRole.MANAGER)
+        service = LeadService(mock_db, context)
+
+        from app.leads.state_machine import LeadStage
+        res = await service.transition_stage(lead.id, LeadStage.DISQUALIFIED, reason="Budget unrealistic")
+
+        assert res.stage == "DISQUALIFIED"
+        assert lead.stage == "DISQUALIFIED"
+
+    async def test_stalled_system_only_rejected_for_user(self, mock_db, tenant_a):
+        lead = _create_mock_lead(tenant_id=tenant_a)
+        lead.stage = "QUALIFYING"
+
+        find_res = MagicMock()
+        find_res.scalars.return_value.first.return_value = lead
+        mock_db.execute.return_value = find_res
+
+        context = TenantContext(user_id=uuid.uuid4(), tenant_id=tenant_a, role=UserRole.MANAGER)
+        service = LeadService(mock_db, context)
+
+        from app.core.exceptions import InvalidTransitionError
+        from app.leads.state_machine import LeadStage
+
+        with pytest.raises(InvalidTransitionError, match="can only be triggered by the system"):
+            await service.transition_stage(lead.id, LeadStage.STALLED, is_system=False)
+
+    async def test_stalled_system_only_allowed_with_is_system(self, mock_db, tenant_a):
+        lead = _create_mock_lead(tenant_id=tenant_a)
+        lead.stage = "QUALIFYING"
+
+        find_res = MagicMock()
+        find_res.scalars.return_value.first.return_value = lead
+        mock_db.execute.return_value = find_res
+
+        context = TenantContext(user_id=uuid.uuid4(), tenant_id=tenant_a, role=UserRole.SUPER_ADMIN)
+        service = LeadService(mock_db, context)
+
+        from app.leads.state_machine import LeadStage
+        res = await service.transition_stage(lead.id, LeadStage.STALLED, is_system=True)
+
+        assert res.stage == "STALLED"
+        assert lead.stage == "STALLED"
+

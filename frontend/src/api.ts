@@ -1,4 +1,8 @@
 import type {
+  GoogleAuthorizeResponse,
+  GoogleConfigUpdateRequest,
+  GoogleStatusResponse,
+  InventorySyncResponse,
   Lead,
   LeadActivity,
   LeadPropertyMatch,
@@ -9,7 +13,7 @@ import type {
   UserSummary,
 } from "./types";
 
-const API_BASE = "http://localhost:8000/api/v1";
+const API_BASE = (import.meta.env.VITE_API_BASE || "/api/v1").replace(/\/+$/, "");
 
 class ApiClient {
   private token: string | null = null;
@@ -118,7 +122,7 @@ class ApiClient {
   }
 
   async transitionLead(leadId: string, targetStage: string, reason?: string): Promise<Lead> {
-    return this.request<Lead>(`/leads/${leadId}/transition`, {
+    return this.request<Lead>(`/leads/${leadId}/stage`, {
       method: "POST",
       body: JSON.stringify({ target_stage: targetStage, reason }),
     });
@@ -212,6 +216,34 @@ class ApiClient {
     return this.request<{ invitation_token: string }>("/users/invite", {
       method: "POST",
       body: JSON.stringify({ email, full_name: fullName, role }),
+    });
+  }
+
+  // ── Google Sheets Integration ──────────────────────────────────────────────
+  async getGoogleAuthorizeUrl(): Promise<GoogleAuthorizeResponse> {
+    return this.request<GoogleAuthorizeResponse>("/integrations/google/authorize");
+  }
+
+  async getGoogleStatus(): Promise<GoogleStatusResponse> {
+    return this.request<GoogleStatusResponse>("/integrations/google/status");
+  }
+
+  async updateGoogleConfig(payload: GoogleConfigUpdateRequest): Promise<GoogleStatusResponse> {
+    return this.request<GoogleStatusResponse>("/integrations/google/config", {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    });
+  }
+
+  async syncGoogleInventory(): Promise<InventorySyncResponse> {
+    return this.request<InventorySyncResponse>("/integrations/google/sync/inventory", {
+      method: "POST",
+    });
+  }
+
+  async disconnectGoogle(): Promise<{ status: string }> {
+    return this.request<{ status: string }>("/integrations/google/disconnect", {
+      method: "POST",
     });
   }
 }

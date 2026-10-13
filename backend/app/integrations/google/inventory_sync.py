@@ -5,6 +5,7 @@ and performs idempotent synchronization against canonical CRM Property models an
 inventory staging workflow.
 """
 
+import asyncio
 import hashlib
 import re
 import uuid
@@ -33,7 +34,19 @@ logger = structlog.get_logger()
 settings = get_settings()
 
 DEFAULT_COLUMN_MAPPINGS = {
-    "external_id": ["id", "property_id", "external_id", "listing_id", "code"],
+    "external_id": [
+        "id",
+        "property_id",
+        "property id",
+        "external_id",
+        "listing_id",
+        "listing id",
+        "code",
+        "ref",
+        "reference",
+        "prop_id",
+        "uid",
+    ],
     "title": ["title", "property_name", "property name", "name", "project", "listing_title"],
     "property_type": ["property_type", "property type", "type", "category"],
     "bhk": ["configuration", "config", "bhk", "bedrooms", "rooms"],
@@ -59,6 +72,10 @@ def _mask_phone(phone: str | None) -> str:
     return f"{p[:3]}****{p[-4:]}"
 
 
+class SyncLockLostError(Exception):
+    """Raised when an in-flight sync operation loses its distributed lease lock."""
+
+
 class PropertyInventorySyncService:
     """
     Coordinates idempotent property inventory sync from Google Sheets to CRM database.
@@ -72,10 +89,46 @@ class PropertyInventorySyncService:
         db: AsyncSession,
         tenant_id: uuid.UUID,
         sheets_client: GoogleSheetsClient | None = None,
+        lock_token: str | None = None,
+        lock_ttl_seconds: int | None = None,
+        heartbeat_interval_seconds: int = 60,
     ) -> None:
         self.db = db
         self.tenant_id = tenant_id
         self._custom_sheets_client = sheets_client
+        self.lock_token = lock_token
+        self.lock_ttl_seconds = lock_ttl_seconds
+        self.heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._last_heartbeat = datetime.now(UTC)
+
+    async def renew_lease(self) -> bool:
+        """Explicitly renew the active synchronization lease lock."""
+        if not self.lock_token:
+            return True
+        google_svc = GoogleIntegrationService(self.db, self.tenant_id)
+        renewed = await google_svc.renew_sync_lock(self.lock_token, lock_ttl_seconds=self.lock_ttl_seconds)
+        if not renewed:
+            logger.error(
+                "sync_lease_lost_during_renewal",
+                tenant_id=str(self.tenant_id),
+                lock_token=self.lock_token,
+            )
+            return False
+        self._last_heartbeat = datetime.now(UTC)
+        await self.db.commit()
+        return True
+
+    async def _heartbeat_checkpoint(self) -> None:
+        """Verify and extend the lease lock if the heartbeat interval has elapsed."""
+        if not self.lock_token:
+            return
+        now = datetime.now(UTC)
+        if (now - self._last_heartbeat).total_seconds() >= self.heartbeat_interval_seconds:
+            renewed = await self.renew_lease()
+            if not renewed:
+                raise SyncLockLostError(
+                    f"Sync lease lock {self.lock_token} was lost or expired for tenant {self.tenant_id}"
+                )
 
     async def _resolve_sheets_client(self, integration: TenantGoogleIntegration) -> GoogleSheetsClient:
         """Resolve Google Sheets client based on configuration and tenant OAuth token."""
@@ -112,18 +165,68 @@ class PropertyInventorySyncService:
 
         now = datetime.now(UTC)
 
+        # Protect initial client.get_rows() from lease expiry:
+        # Bounded timeout for fetching rows from external Google Sheets
+        lock_ttl = float(self.lock_ttl_seconds) if self.lock_ttl_seconds is not None else 300.0
+        get_rows_timeout = min(lock_ttl, 60.0) if self.lock_token else 60.0
+
+        heartbeat_task = None
+        stop_heartbeat = asyncio.Event()
+
+        async def _heartbeat_worker():
+            hb_interval = float(self.heartbeat_interval_seconds) if self.heartbeat_interval_seconds else 60.0
+            interval = max(1.0, min(hb_interval, lock_ttl / 3.0))
+            while not stop_heartbeat.is_set():
+                try:
+                    await asyncio.wait_for(stop_heartbeat.wait(), timeout=interval)
+                    break
+                except TimeoutError:
+                    pass
+                if not stop_heartbeat.is_set():
+                    renewed = await self.renew_lease()
+                    if not renewed:
+                        break
+
+        if self.lock_token:
+            heartbeat_task = asyncio.create_task(_heartbeat_worker())
+
         try:
             client = await self._resolve_sheets_client(integration)
-            rows = await client.get_rows(spreadsheet_id, range_name)
+            rows = await asyncio.wait_for(
+                client.get_rows(spreadsheet_id, range_name),
+                timeout=get_rows_timeout,
+            )
         except (OAuthRevokedError, SpreadsheetAccessError, SpreadsheetNotFoundError, GoogleSheetsClientError) as exc:
+            if self.lock_token and not await self.renew_lease():
+                raise SyncLockLostError(
+                    f"Sync lease lock {self.lock_token} was lost during client error handling for tenant {self.tenant_id}"
+                )
             integration.last_sync_at = now
             integration.last_sync_status = "FAILED"
             integration.last_sync_error = str(exc)
             await self.db.flush()
             logger.error("inventory_sync_failed_client_error", tenant_id=str(self.tenant_id), error=str(exc))
             raise
+        except TimeoutError as exc:
+            logger.error("inventory_sync_get_rows_timeout", tenant_id=str(self.tenant_id), timeout=get_rows_timeout)
+            raise GoogleSheetsClientError(f"Google Sheets get_rows timed out after {get_rows_timeout} seconds") from exc
+        finally:
+            stop_heartbeat.set()
+            if heartbeat_task:
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
+
+        # Stale worker guard: verify lease validity immediately after get_rows completes
+        if self.lock_token:
+            if not await self.renew_lease():
+                raise SyncLockLostError(
+                    f"Sync lease lock {self.lock_token} was lost or expired after get_rows for tenant {self.tenant_id}"
+                )
 
         if not rows:
+            if self.lock_token and not await self.renew_lease():
+                raise SyncLockLostError(
+                    f"Sync lease lock {self.lock_token} was lost before writing empty sync results for tenant {self.tenant_id}"
+                )
             integration.last_sync_at = now
             integration.last_sync_status = "SUCCESS"
             integration.last_sync_stats = {
@@ -165,6 +268,8 @@ class PropertyInventorySyncService:
         errors: list[dict[str, Any]] = []
 
         for row_idx, row_values in enumerate(data_rows, start=2):
+            await self._heartbeat_checkpoint()
+
             if not row_values or not any(str(v).strip() for v in row_values):
                 skipped_count += 1
                 continue
@@ -191,6 +296,8 @@ class PropertyInventorySyncService:
                 else:
                     skipped_count += 1
 
+            except SyncLockLostError:
+                raise
             except Exception as exc:
                 err_msg = str(exc)
                 errors.append({"row_number": row_idx, "error": err_msg})
@@ -213,14 +320,22 @@ class PropertyInventorySyncService:
                     row_values=row_values,
                 )
 
+        if self.lock_token:
+            if not await self.renew_lease():
+                raise SyncLockLostError(
+                    f"Sync lease lock {self.lock_token} was lost or expired for tenant {self.tenant_id}"
+                )
+
         status_str = (
             "SUCCESS"
             if not errors
             else ("PARTIAL_SUCCESS" if (created_count or updated_count or staged_count) else "FAILED")
         )
         integration.last_sync_at = now
-        integration.last_sync_status = status_str
-        integration.last_sync_stats = {
+        if not self.lock_token:
+            integration.last_sync_status = status_str
+        stats = dict(integration.last_sync_stats or {})
+        stats.update({
             "total_rows": len(data_rows),
             "created": created_count,
             "updated": updated_count,
@@ -228,7 +343,8 @@ class PropertyInventorySyncService:
             "duplicate_suspects": duplicate_suspects_count,
             "skipped": skipped_count,
             "errors": len(errors),
-        }
+        })
+        integration.last_sync_stats = stats
         integration.last_sync_error = f"{len(errors)} row synchronization errors" if errors else None
         await self.db.flush()
 
@@ -359,9 +475,14 @@ class PropertyInventorySyncService:
                 else "Missing property type"
             )
 
-        # Location fallback / validation
-        if not loc:
-            loc = "Central"
+        # Location validation: Must be non-empty string
+        if not loc or not loc.strip():
+            raise ValueError(
+                f"Invalid or missing property location: {loc!r}"
+                if loc
+                else "Missing property location"
+            )
+        loc = loc.strip()
 
         # BHK extraction
         bhk = self._parse_bhk(raw_bhk, raw_type, prop_type)
@@ -419,19 +540,19 @@ class PropertyInventorySyncService:
         cleaned = cleaned.replace(",", "")
         try:
             # Check for Crores
-            cr_match = re.search(r"([\d.]+)\s*(?:cr|crore|crs)", cleaned)
+            cr_match = re.search(r"([\d.]+)\s*(?:cr|crore|crores|crs)\b", cleaned)
             if cr_match:
                 val = float(cr_match.group(1))
                 return int(val * 10_000_000) if val > 0 else None
 
             # Check for Lakhs
-            lakh_match = re.search(r"([\d.]+)\s*(?:lakh|lac|lacs|l)\b", cleaned)
+            lakh_match = re.search(r"([\d.]+)\s*(?:lakh|lakhs|lac|lacs|l)\b", cleaned)
             if lakh_match:
                 val = float(lakh_match.group(1))
                 return int(val * 100_000) if val > 0 else None
 
             # Check for Thousands
-            k_match = re.search(r"([\d.]+)\s*(?:k|thousand)\b", cleaned)
+            k_match = re.search(r"([\d.]+)\s*(?:k|thousand|thousands)\b", cleaned)
             if k_match:
                 val = float(k_match.group(1))
                 return int(val * 1_000) if val > 0 else None
@@ -623,9 +744,9 @@ class PropertyInventorySyncService:
                     prop.area_sqft = data["area_sqft"]
                 if data.get("description") is not None:
                     prop.description = data["description"]
-                if data.get("owner_name"):
+                if "owner_name" in data:
                     prop.owner_name = data["owner_name"]
-                if data.get("owner_phone"):
+                if "owner_phone" in data:
                     prop.owner_phone = data["owner_phone"]
                 prop.source_data = raw_data
                 await self.db.flush()

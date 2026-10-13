@@ -133,8 +133,15 @@ class QualificationService:
             )
             self.db.add(proposal)
 
-            # Advance stage from NEW to QUALIFYING if applicable
+            # Advance stage from NEW to QUALIFYING if applicable via state machine
             if lead.stage == LeadStage.NEW.value:
+                from app.leads.state_machine import validate_transition
+                validate_transition(
+                    from_stage=LeadStage.NEW,
+                    to_stage=LeadStage.QUALIFYING,
+                    actor_role=self.context.role,
+                    is_system=True,
+                )
                 lead.stage = LeadStage.QUALIFYING.value
 
             lead.last_activity_at = now
@@ -220,7 +227,7 @@ class QualificationService:
 
         async with self.db.begin_nested() if self.db.in_transaction() else self.db.begin():
             proposal.reviewed_by = self.context.user_id
-            proposal.reviewed_at = now
+            proposal.reviewed_at = now.replace(tzinfo=None)
             proposal.review_notes = review_notes
 
             if action == "ACCEPT":
@@ -242,8 +249,14 @@ class QualificationService:
                 if proposal.move_in_timeline is not None:
                     lead.move_in_timeline = proposal.move_in_timeline
 
-                # Progress stage if in early qualification stages
+                # Progress stage if in early qualification stages via state machine
                 if lead.stage in (LeadStage.NEW.value, LeadStage.QUALIFYING.value):
+                    from app.leads.state_machine import validate_transition
+                    from_stage = LeadStage(lead.stage) if isinstance(lead.stage, str) else lead.stage
+                    if from_stage == LeadStage.NEW:
+                        validate_transition(LeadStage.NEW, LeadStage.QUALIFYING, self.context.role, is_system=True)
+                        from_stage = LeadStage.QUALIFYING
+                    validate_transition(from_stage, LeadStage.QUALIFIED, self.context.role, is_system=False)
                     lead.stage = LeadStage.QUALIFIED.value
 
                 # Recalculate deterministic lead intent score and health
@@ -270,6 +283,23 @@ class QualificationService:
                     created_at=now,
                 )
                 self.db.add(activity)
+
+                # Enqueue idempotent automatic property matching request
+                from app.messaging.outbox_service import OutboxService
+                outbox_svc = OutboxService(self.db)
+                await outbox_svc.enqueue_message(
+                    tenant_id=lead.tenant_id,
+                    event_type="MATCH_COMPUTATION_REQUESTED",
+                    aggregate_type="LEAD",
+                    aggregate_id=lead.id,
+                    payload={
+                        "lead_id": str(lead.id),
+                        "proposal_id": str(proposal.id),
+                        "score": lead.intent_score,
+                        "health": lead.lead_health,
+                    },
+                    idempotency_key=f"match-compute-{lead.id}",
+                )
 
             elif action == "REJECT":
                 proposal.status = "REJECTED"

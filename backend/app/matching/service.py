@@ -106,12 +106,13 @@ class MatchingService:
                 matches.append(match)
 
             # Record activity
+            is_system = self.context.role == UserRole.SUPER_ADMIN or not self.context.user_id
             activity = LeadActivity(
                 id=uuid.uuid4(),
                 tenant_id=lead.tenant_id,
                 lead_id=lead.id,
-                actor_id=self.context.user_id,
-                actor_type="SYSTEM" if self.context.role == UserRole.SUPER_ADMIN else "USER",
+                actor_id=None if is_system else self.context.user_id,
+                actor_type="SYSTEM" if is_system else "USER",
                 activity_type="PROPERTY_MATCHES_COMPUTED",
                 description=f"Computed {len(matches)} property matches (min score {min_score})",
                 metadata_={"matched_count": len(matches), "min_score": min_score},

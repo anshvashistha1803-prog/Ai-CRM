@@ -321,3 +321,16 @@ h1, h2, h3, h4, h5, h6 {
     transform: scale(1);
   }
 }
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.spin-icon {
+  animation: spin 1s linear infinite;
+}

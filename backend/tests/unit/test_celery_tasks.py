@@ -170,7 +170,6 @@ async def test_process_outbox_batch_async_success(mock_db):
         patch("app.tasks.celery_tasks._get_async_session", return_value=mock_session_factory),
         patch("app.messaging.outbox_service.OutboxService.reclaim_stale_processing_messages", new_callable=AsyncMock) as mock_reclaim,
         patch("app.messaging.outbox_service.OutboxService.fetch_pending_messages", new_callable=AsyncMock) as mock_fetch,
-        patch("app.messaging.outbox_service.OutboxService.mark_processing", new_callable=AsyncMock) as mock_processing,
         patch("app.messaging.outbox_service.OutboxService.mark_sent", new_callable=AsyncMock) as mock_sent,
     ):
         mock_fetch.return_value = [msg1]
@@ -178,7 +177,7 @@ async def test_process_outbox_batch_async_success(mock_db):
         count = await _process_outbox_batch_async()
         assert count == 1
         mock_reclaim.assert_called_once()
-        mock_processing.assert_called_once_with(msg1.id)
+        assert msg1.status == "PROCESSING"
         assert mock_sent.call_args[0][0] == msg1.id
         assert mock_db.commit.called
 
@@ -205,7 +204,6 @@ async def test_process_outbox_batch_async_failure(mock_db):
         patch("app.tasks.celery_tasks._get_async_session", return_value=mock_session_factory),
         patch("app.messaging.outbox_service.OutboxService.reclaim_stale_processing_messages", new_callable=AsyncMock),
         patch("app.messaging.outbox_service.OutboxService.fetch_pending_messages", new_callable=AsyncMock) as mock_fetch,
-        patch("app.messaging.outbox_service.OutboxService.mark_processing", new_callable=AsyncMock),
         patch("app.tasks.celery_tasks._handle_message_event", side_effect=RuntimeError("Dispatch error")),
         patch("app.messaging.outbox_service.OutboxService.mark_failed", new_callable=AsyncMock) as mock_failed,
     ):
@@ -213,6 +211,7 @@ async def test_process_outbox_batch_async_failure(mock_db):
 
         count = await _process_outbox_batch_async()
         assert count == 0
+        assert msg1.status == "PROCESSING"
         mock_failed.assert_called_once()
         assert "Dispatch error" in mock_failed.call_args[1]["error_message"]
 
@@ -317,13 +316,16 @@ def test_dispatch_outbox_message_success(mock_db):
 
     with (
         patch("app.tasks.celery_tasks._get_async_session", return_value=mock_session_factory),
-        patch("app.messaging.outbox_service.OutboxService.get_message", new_callable=AsyncMock) as mock_get,
-        patch("app.messaging.outbox_service.OutboxService.mark_processing", new_callable=AsyncMock),
-        patch("app.messaging.outbox_service.OutboxService.mark_sent", new_callable=AsyncMock),
+        patch("app.messaging.outbox_service.OutboxService.claim_message", new_callable=AsyncMock) as mock_claim,
+        patch("app.messaging.outbox_service.OutboxService.mark_sent", new_callable=AsyncMock) as mock_sent,
     ):
-        mock_get.return_value = msg
+        msg.status = "PROCESSING"
+        msg.updated_at = datetime.now(UTC)
+        mock_claim.return_value = msg
         result = dispatch_outbox_message(str(msg_id))
         assert result is True
+        mock_claim.assert_called_once_with(msg_id)
+        assert mock_sent.call_args[0][0] == msg_id
         assert mock_db.commit.called
 
 
@@ -347,13 +349,97 @@ def test_dispatch_outbox_message_failure(mock_db):
 
     with (
         patch("app.tasks.celery_tasks._get_async_session", return_value=mock_session_factory),
-        patch("app.messaging.outbox_service.OutboxService.get_message", new_callable=AsyncMock) as mock_get,
-        patch("app.messaging.outbox_service.OutboxService.mark_processing", new_callable=AsyncMock),
+        patch("app.messaging.outbox_service.OutboxService.claim_message", new_callable=AsyncMock) as mock_claim,
         patch("app.tasks.celery_tasks._handle_message_event", side_effect=Exception("Delivery failed")),
         patch("app.messaging.outbox_service.OutboxService.mark_failed", new_callable=AsyncMock) as mock_failed,
     ):
-        mock_get.return_value = msg
+        msg.status = "PROCESSING"
+        msg.updated_at = datetime.now(UTC)
+        mock_claim.return_value = msg
         result = dispatch_outbox_message(str(msg_id))
         assert result is False
+        mock_claim.assert_called_once_with(msg_id)
         mock_failed.assert_called_once()
         assert mock_db.commit.called
+
+
+def test_celery_task_queue_alignment():
+    """
+    Ensure every registered task is routed to an explicit queue that is consumed
+    by the worker command in docker-compose.yml (-Q default,messages,qualification).
+    """
+    from app.tasks.celery_app import celery_app
+
+    worker_queues = {"default", "messages", "qualification"}
+
+    # 1. Default queue must be in worker queues (never default to unconsumed 'celery')
+    assert celery_app.conf.task_default_queue in worker_queues
+
+    # 2. Inspect registered tasks
+    tasks = [
+        process_outbox_batch,
+        detect_stalled_leads_batch,
+        dispatch_outbox_message,
+    ]
+
+    for task in tasks:
+        effective_queue = (
+            task.queue
+            or celery_app.conf.task_routes.get(task.name, {}).get("queue")
+            or celery_app.conf.task_default_queue
+        )
+        assert effective_queue in worker_queues, (
+            f"Task {task.name} routes to {effective_queue}, not in worker queues {worker_queues}"
+        )
+
+    # 3. Check specific queue assignments
+    assert process_outbox_batch.queue == "messages"
+    assert dispatch_outbox_message.queue == "messages"
+    assert detect_stalled_leads_batch.queue == "default"
+
+    # 4. Celery Beat periodic schedules must route to worker queues
+    beat_schedule = celery_app.conf.beat_schedule
+    for schedule_name, schedule_cfg in beat_schedule.items():
+        queue = (
+            schedule_cfg.get("options", {}).get("queue")
+            or celery_app.conf.task_routes.get(schedule_cfg["task"], {}).get("queue")
+            or celery_app.conf.task_default_queue
+        )
+        assert queue in worker_queues, (
+            f"Beat schedule {schedule_name} routes to {queue}, not in worker queues {worker_queues}"
+        )
+
+
+def test_compose_settings_mapping():
+    """
+    Verify that application Settings attributes correctly map to expected environment variable names.
+    """
+    from app.core.config import Settings
+
+    field_names = set(Settings.model_fields.keys())
+    assert "secret_key" in field_names
+    assert "app_encryption_key" in field_names
+    assert "jwt_private_key_path" in field_names
+    assert "jwt_public_key_path" in field_names
+    assert "jwt_algorithm" in field_names
+    assert "jwt_access_token_expire_minutes" in field_names
+    assert "jwt_refresh_token_expire_days" in field_names
+    assert "whatsapp_verify_token" in field_names
+    assert "whatsapp_app_secret" in field_names
+
+
+def test_missing_jwt_key_fails_safely():
+    """
+    In RS256 mode, missing key files must fail closed with FileNotFoundError and never silently succeed.
+    """
+    from app.core.config import get_settings
+    from app.core.security import _load_private_key
+
+    settings = get_settings()
+    original_path = settings.jwt_private_key_path
+    try:
+        settings.jwt_private_key_path = "./keys/non_existent_key_12345.pem"
+        with pytest.raises(FileNotFoundError, match="JWT private key not found"):
+            _load_private_key()
+    finally:
+        settings.jwt_private_key_path = original_path
