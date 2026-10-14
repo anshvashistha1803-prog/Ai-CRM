@@ -89,6 +89,7 @@ def _register_routers(app: FastAPI) -> None:
     from app.integrations.google.router import router as google_router
     from app.leads.router import router as leads_router
     from app.matching.router import router as matching_router
+    from app.messaging.router import router as messaging_router
     from app.properties.router import router as properties_router
     from app.qualification.router import router as qualification_router
     from app.tenants.router import router as tenants_router
@@ -102,6 +103,7 @@ def _register_routers(app: FastAPI) -> None:
     app.include_router(google_router, prefix=api_prefix)
     app.include_router(leads_router, prefix=api_prefix)
     app.include_router(matching_router, prefix=api_prefix)
+    app.include_router(messaging_router, prefix=api_prefix)
     app.include_router(properties_router, prefix=api_prefix)
     app.include_router(qualification_router, prefix=api_prefix)
     app.include_router(tenants_router, prefix=api_prefix)

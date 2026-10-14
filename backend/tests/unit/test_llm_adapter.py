@@ -48,9 +48,28 @@ class TestQualificationSchema:
         with pytest.raises(ValidationError):
             QualificationExtraction(purpose="INVALID_ACTION")
 
-    def test_invalid_bhk_out_of_range(self):
-        with pytest.raises(ValidationError):
-            QualificationExtraction(bhk=25)
+    def test_defensive_property_type_synonyms(self):
+        assert QualificationExtraction(property_type="flat").property_type == "APARTMENT"
+        assert QualificationExtraction(property_type="society flat").property_type == "APARTMENT"
+        assert QualificationExtraction(property_type="kothi").property_type == "VILLA"
+        assert QualificationExtraction(property_type="pent house").property_type == "PENTHOUSE"
+        assert QualificationExtraction(property_type="zameen").property_type == "PLOT"
+        assert QualificationExtraction(property_type="office").property_type == "COMMERCIAL"
+
+    def test_defensive_purpose_synonyms(self):
+        assert QualificationExtraction(purpose="buying").purpose == "BUY"
+        assert QualificationExtraction(purpose="selling").purpose == "SELL"
+        assert QualificationExtraction(purpose="rental").purpose == "RENT"
+        assert QualificationExtraction(purpose="investing").purpose == "INVEST"
+
+    def test_confidence_scores_none_handled(self):
+        item = QualificationExtraction(confidence_scores=None)
+        assert item.confidence_scores == {}
+
+    def test_summary_truncation(self):
+        long_summary = "a" * 600
+        item = QualificationExtraction(summary=long_summary)
+        assert len(item.summary) == 500
 
 
 class TestMockLLMAdapter:
@@ -151,6 +170,68 @@ class TestLiteLLMAdapter:
         with (
             patch("litellm.acompletion", new_callable=AsyncMock, side_effect=RuntimeError("Connection timed out")),
             pytest.raises(LLMAdapterError, match="Connection timed out"),
+        ):
+            await adapter.extract_qualification(["Hello"])
+
+    @pytest.mark.asyncio
+    async def test_litellm_adapter_markdown_code_fences_handled(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from app.qualification.llm_adapter import LiteLLMAdapter
+
+        adapter = LiteLLMAdapter()
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(
+                message=MagicMock(
+                    content='```json\n{"budget_min": 5000000, "property_type": "APARTMENT", "purpose": "BUY"}\n```'
+                )
+            )
+        ]
+
+        with patch("litellm.acompletion", new_callable=AsyncMock, return_value=mock_response):
+            extraction, _, _ = await adapter.extract_qualification(["Want 2BHK flat"])
+            assert extraction.budget_min == 5000000
+            assert extraction.property_type == "APARTMENT"
+
+    @pytest.mark.asyncio
+    async def test_litellm_adapter_preamble_and_postscript_handled(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from app.qualification.llm_adapter import LiteLLMAdapter
+
+        adapter = LiteLLMAdapter()
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(
+                message=MagicMock(
+                    content='Here is the extracted qualification:\n{"property_type": "VILLA", "bhk": 4}\nHope this helps!'
+                )
+            )
+        ]
+
+        with patch("litellm.acompletion", new_callable=AsyncMock, return_value=mock_response):
+            extraction, _, _ = await adapter.extract_qualification(["Looking for villa"])
+            assert extraction.property_type == "VILLA"
+            assert extraction.bhk == 4
+
+    @pytest.mark.asyncio
+    async def test_litellm_adapter_unparseable_json_raises_clean_error(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from app.qualification.llm_adapter import LiteLLMAdapter, LLMAdapterError
+
+        adapter = LiteLLMAdapter()
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(
+                message=MagicMock(content="Definitely not JSON at all")
+            )
+        ]
+
+        with (
+            patch("litellm.acompletion", new_callable=AsyncMock, return_value=mock_response),
+            pytest.raises(LLMAdapterError, match="unparseable JSON"),
         ):
             await adapter.extract_qualification(["Hello"])
 

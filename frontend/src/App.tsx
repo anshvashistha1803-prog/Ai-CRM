@@ -124,6 +124,7 @@ export function App() {
               currentUser={currentUser}
               onRefresh={refreshAllData}
               openCreateModal={openCreateLead}
+              onOpenCreateModal={() => setOpenCreateLead(true)}
               onCloseCreateModal={() => setOpenCreateLead(false)}
             />
           )}

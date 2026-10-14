@@ -58,6 +58,10 @@ class MatchingService:
         """
         lead = await self._find_and_authorize_lead(lead_id)
 
+        # Sellers are listing inventory rather than purchasing available inventory
+        if (getattr(lead, "purpose", None) or "").upper() == "SELL":
+            return []
+
         # Retrieve available properties within the same agency
         prop_stmt = select(Property).where(
             Property.tenant_id == lead.tenant_id,

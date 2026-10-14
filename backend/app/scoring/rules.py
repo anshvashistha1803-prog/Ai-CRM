@@ -69,7 +69,7 @@ def rule_intent_and_commitment(lead: Any, answers: dict[str, Any] | None = None)
     elif any(k in purpose for k in ["INVEST", "INVESTMENT", "DEVELOPMENT"]):
         points += 12
         reasons.append("Investor / developer with capital (+12)")
-    elif intent in ["BUY", "SELL"]:
+    elif any(k in purpose for k in ["SELL", "LISTING", "SALE"]) or intent in ["BUY", "SELL"]:
         points += 8
         reasons.append("Clear transaction intent (+8)")
 

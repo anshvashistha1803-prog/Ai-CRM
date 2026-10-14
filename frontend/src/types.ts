@@ -39,7 +39,9 @@ export interface Lead {
   external_id?: string;
   source: string;
   full_name: string;
+  phone?: string;
   phone_masked?: string;
+  email?: string;
   email_masked?: string;
   preferred_contact: string;
   budget_min?: number;

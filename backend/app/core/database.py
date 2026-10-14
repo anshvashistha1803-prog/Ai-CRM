@@ -55,7 +55,20 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """
     Dependency that provides a database session.
     Rolls back on exception; always closes session.
+    Fails closed if invoked in testing context against production database.
     """
+    import os
+
+    from sqlalchemy.engine import make_url
+
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        url = make_url(settings.database_url)
+        if url.database == "havn_crm":
+            raise RuntimeError(
+                "CRITICAL: get_db dependency attempted to open session against 'havn_crm' while running tests! "
+                "Ensure override_get_db fixture is active."
+            )
+
     async with AsyncSessionLocal() as session:
         try:
             yield session

@@ -188,6 +188,17 @@ class TestLeadLifecycleE2E:
         assert err["error"] == "INVALID_TRANSITION"
         assert "not permitted" in err["message"]
 
+        # Prohibited transition: QUALIFYING -> QUALIFIED without qualification evidence
+        t_unqual = await client.post(
+            f"/api/v1/leads/{lead_id}/stage",
+            headers={"Authorization": f"Bearer {manager_token}"},
+            json={"target_stage": "QUALIFIED", "reason": "Direct manual qualification attempt"},
+        )
+        assert t_unqual.status_code == 422, t_unqual.text
+        err_unqual = t_unqual.json()
+        assert err_unqual["error"] == "INVALID_TRANSITION"
+        assert "without accepted qualification evidence" in err_unqual["message"]
+
         # Database state must remain unchanged at QUALIFYING
         await db.refresh(lead_db)
         assert lead_db.stage == LeadStage.QUALIFYING.value

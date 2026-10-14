@@ -54,7 +54,9 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.1
     llm_max_tokens: int = 1000
 
-    # ── WhatsApp ──────────────────────────────────────────────────────────────
+    # ── Meta Lead Ads & WhatsApp ──────────────────────────────────────────────
+    meta_app_secret: str = ""
+    meta_verify_token: str = ""
     whatsapp_app_secret: str = ""
     whatsapp_verify_token: str = ""
     whatsapp_api_version: str = "v19.0"

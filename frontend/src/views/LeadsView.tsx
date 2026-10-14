@@ -10,6 +10,7 @@ import {
   X,
 } from "lucide-react";
 import { api } from "../api";
+import { maskPhone } from "../utils/phone";
 import type { Lead, LeadActivity, LeadPropertyMatch, UserSummary } from "../types";
 
 interface LeadsViewProps {
@@ -18,6 +19,7 @@ interface LeadsViewProps {
   currentUser?: UserSummary | null;
   onRefresh: () => void;
   openCreateModal: boolean;
+  onOpenCreateModal: () => void;
   onCloseCreateModal: () => void;
 }
 
@@ -62,6 +64,7 @@ export const LeadsView: React.FC<LeadsViewProps> = ({
   currentUser,
   onRefresh,
   openCreateModal,
+  onOpenCreateModal,
   onCloseCreateModal,
 }) => {
   const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
@@ -134,18 +137,26 @@ export const LeadsView: React.FC<LeadsViewProps> = ({
 
   const handleCreateSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!newFullName.trim()) {
+      setCreateError("Full name is required.");
+      return;
+    }
+    if (!newPhone.trim()) {
+      setCreateError("Phone number is required.");
+      return;
+    }
     setCreateLoading(true);
     setCreateError(null);
 
     try {
       await api.createLead({
-        full_name: newFullName,
-        phone: newPhone,
-        email: newEmail || undefined,
+        full_name: newFullName.trim(),
+        phone: newPhone.trim(),
+        email: newEmail.trim() || undefined,
         budget_max: newBudgetMax ? parseInt(newBudgetMax, 10) : undefined,
         bhk: newBhk ? parseInt(newBhk, 10) : undefined,
         property_type: newPropType,
-        preferred_location: newLocation || undefined,
+        preferred_location: newLocation.trim() || undefined,
       });
       onCloseCreateModal();
       onRefresh();
@@ -153,6 +164,7 @@ export const LeadsView: React.FC<LeadsViewProps> = ({
       setNewPhone("");
       setNewEmail("");
       setNewBudgetMax("");
+      setNewLocation("");
     } catch (err: any) {
       setCreateError(err.message || "Failed to create lead.");
     } finally {
@@ -179,7 +191,7 @@ export const LeadsView: React.FC<LeadsViewProps> = ({
           <h1 className="page-title">Lead Management & Pipeline</h1>
           <p className="page-subtitle">Track prospects through qualification, automated scoring, and property matching</p>
         </div>
-        <button className="btn btn-primary" onClick={() => onCloseCreateModal()}>
+        <button className="btn btn-primary" onClick={onOpenCreateModal} id="add-lead-btn">
           <Plus size={16} /> Add Prospective Lead
         </button>
       </div>
@@ -261,7 +273,9 @@ export const LeadsView: React.FC<LeadsViewProps> = ({
                     <td>
                       <div style={{ fontWeight: 600 }}>{lead.full_name}</div>
                       <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
-                        {lead.source} • {lead.preferred_contact}
+                        <span>{maskPhone(lead.phone, lead.phone_masked)}</span>
+                        {lead.source ? ` • ${lead.source}` : ""}
+                        {lead.preferred_contact ? ` • ${lead.preferred_contact}` : ""}
                       </div>
                     </td>
                     <td>
@@ -346,11 +360,39 @@ export const LeadsView: React.FC<LeadsViewProps> = ({
                   )}
                 </div>
                 <div style={{ fontSize: "0.8125rem", color: "var(--text-muted)", marginTop: "4px" }}>
-                  Source: {selectedLead.source} • Registered: {new Date(selectedLead.created_at).toLocaleDateString()}
+                  {selectedLead.source ? `Source: ${selectedLead.source} • ` : ""}
+                  Registered: {selectedLead.created_at ? new Date(selectedLead.created_at).toLocaleDateString() : "N/A"}
                 </div>
+                {(selectedLead.phone || selectedLead.email) && (
+                  <div
+                    data-testid="lead-drawer-contact"
+                    style={{
+                      fontSize: "0.8125rem",
+                      color: "var(--text-secondary)",
+                      marginTop: "8px",
+                      display: "flex",
+                      gap: "16px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    {selectedLead.phone && (
+                      <span data-testid="lead-drawer-phone">
+                        <strong style={{ color: "var(--text-muted)", marginRight: "4px" }}>Phone:</strong>
+                        {selectedLead.phone}
+                      </span>
+                    )}
+                    {selectedLead.email && (
+                      <span data-testid="lead-drawer-email">
+                        <strong style={{ color: "var(--text-muted)", marginRight: "4px" }}>Email:</strong>
+                        {selectedLead.email}
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
               <button
                 onClick={() => setSelectedLead(null)}
+                aria-label="Close lead drawer"
                 style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer" }}
               >
                 <X size={20} />
@@ -475,6 +517,20 @@ export const LeadsView: React.FC<LeadsViewProps> = ({
                       {selectedLead.move_in_timeline || "Flexible"}
                     </div>
                   </div>
+
+                  {(selectedLead.phone || selectedLead.email) && (
+                    <div style={{ padding: "14px", backgroundColor: "rgba(255, 255, 255, 0.02)", borderRadius: "var(--radius-md)", gridColumn: "span 2" }}>
+                      <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Contact Details</div>
+                      <div style={{ fontSize: "0.875rem", marginTop: "4px", display: "flex", gap: "20px", flexWrap: "wrap" }}>
+                        {selectedLead.phone && (
+                          <span><strong>Phone:</strong> {selectedLead.phone}</span>
+                        )}
+                        {selectedLead.email && (
+                          <span><strong>Email:</strong> {selectedLead.email}</span>
+                        )}
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 {selectedLead.raw_message_text && (
@@ -597,11 +653,16 @@ export const LeadsView: React.FC<LeadsViewProps> = ({
 
       {/* Create Lead Modal */}
       {openCreateModal && (
-        <div className="modal-backdrop">
+        <div className="modal-backdrop" data-testid="create-lead-modal">
           <div className="modal-content" style={{ maxWidth: "480px" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "20px" }}>
               <h3 style={{ fontSize: "1.25rem" }}>Add Prospective Lead</h3>
-              <button onClick={onCloseCreateModal} style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer" }}>
+              <button
+                onClick={onCloseCreateModal}
+                aria-label="Close modal"
+                data-testid="close-create-modal"
+                style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer" }}
+              >
                 <X size={18} />
               </button>
             </div>
@@ -614,24 +675,47 @@ export const LeadsView: React.FC<LeadsViewProps> = ({
 
             <form onSubmit={handleCreateSubmit} style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
               <div>
-                <label style={{ fontSize: "0.75rem", color: "var(--text-secondary)", display: "block", marginBottom: "4px" }}>Full Name *</label>
-                <input required type="text" className="form-control" value={newFullName} onChange={(e) => setNewFullName(e.target.value)} />
+                <label htmlFor="lead-full-name" style={{ fontSize: "0.75rem", color: "var(--text-secondary)", display: "block", marginBottom: "4px" }}>Full Name *</label>
+                <input
+                  id="lead-full-name"
+                  required
+                  type="text"
+                  className="form-control"
+                  placeholder="e.g. John Doe"
+                  value={newFullName}
+                  onChange={(e) => setNewFullName(e.target.value)}
+                />
               </div>
 
               <div>
-                <label style={{ fontSize: "0.75rem", color: "var(--text-secondary)", display: "block", marginBottom: "4px" }}>Phone Number (E.164) *</label>
-                <input required type="tel" className="form-control" placeholder="+919876543210" value={newPhone} onChange={(e) => setNewPhone(e.target.value)} />
+                <label htmlFor="lead-phone" style={{ fontSize: "0.75rem", color: "var(--text-secondary)", display: "block", marginBottom: "4px" }}>Phone Number (E.164) *</label>
+                <input
+                  id="lead-phone"
+                  required
+                  type="tel"
+                  className="form-control"
+                  placeholder="+919876543210"
+                  value={newPhone}
+                  onChange={(e) => setNewPhone(e.target.value)}
+                />
               </div>
 
               <div>
-                <label style={{ fontSize: "0.75rem", color: "var(--text-secondary)", display: "block", marginBottom: "4px" }}>Email Address</label>
-                <input type="email" className="form-control" placeholder="client@example.com" value={newEmail} onChange={(e) => setNewEmail(e.target.value)} />
+                <label htmlFor="lead-email" style={{ fontSize: "0.75rem", color: "var(--text-secondary)", display: "block", marginBottom: "4px" }}>Email Address</label>
+                <input
+                  id="lead-email"
+                  type="email"
+                  className="form-control"
+                  placeholder="client@example.com"
+                  value={newEmail}
+                  onChange={(e) => setNewEmail(e.target.value)}
+                />
               </div>
 
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
                 <div>
-                  <label style={{ fontSize: "0.75rem", color: "var(--text-secondary)", display: "block", marginBottom: "4px" }}>BHK</label>
-                  <select className="form-control" value={newBhk} onChange={(e) => setNewBhk(e.target.value)}>
+                  <label htmlFor="lead-bhk" style={{ fontSize: "0.75rem", color: "var(--text-secondary)", display: "block", marginBottom: "4px" }}>BHK</label>
+                  <select id="lead-bhk" className="form-control" value={newBhk} onChange={(e) => setNewBhk(e.target.value)}>
                     <option value="1">1 BHK</option>
                     <option value="2">2 BHK</option>
                     <option value="3">3 BHK</option>
@@ -639,8 +723,8 @@ export const LeadsView: React.FC<LeadsViewProps> = ({
                   </select>
                 </div>
                 <div>
-                  <label style={{ fontSize: "0.75rem", color: "var(--text-secondary)", display: "block", marginBottom: "4px" }}>Property Type</label>
-                  <select className="form-control" value={newPropType} onChange={(e) => setNewPropType(e.target.value)}>
+                  <label htmlFor="lead-property-type" style={{ fontSize: "0.75rem", color: "var(--text-secondary)", display: "block", marginBottom: "4px" }}>Property Type</label>
+                  <select id="lead-property-type" className="form-control" value={newPropType} onChange={(e) => setNewPropType(e.target.value)}>
                     <option value="APARTMENT">Apartment</option>
                     <option value="VILLA">Villa</option>
                     <option value="PLOT">Plot</option>
@@ -650,13 +734,13 @@ export const LeadsView: React.FC<LeadsViewProps> = ({
               </div>
 
               <div>
-                <label style={{ fontSize: "0.75rem", color: "var(--text-secondary)", display: "block", marginBottom: "4px" }}>Budget Max (INR)</label>
-                <input type="number" className="form-control" placeholder="15000000" value={newBudgetMax} onChange={(e) => setNewBudgetMax(e.target.value)} />
+                <label htmlFor="lead-budget-max" style={{ fontSize: "0.75rem", color: "var(--text-secondary)", display: "block", marginBottom: "4px" }}>Budget Max (INR)</label>
+                <input id="lead-budget-max" type="number" className="form-control" placeholder="15000000" value={newBudgetMax} onChange={(e) => setNewBudgetMax(e.target.value)} />
               </div>
 
               <div>
-                <label style={{ fontSize: "0.75rem", color: "var(--text-secondary)", display: "block", marginBottom: "4px" }}>Preferred Location</label>
-                <input type="text" className="form-control" placeholder="e.g. Whitefield, Indiranagar" value={newLocation} onChange={(e) => setNewLocation(e.target.value)} />
+                <label htmlFor="lead-location" style={{ fontSize: "0.75rem", color: "var(--text-secondary)", display: "block", marginBottom: "4px" }}>Preferred Location</label>
+                <input id="lead-location" type="text" className="form-control" placeholder="e.g. Whitefield, Indiranagar" value={newLocation} onChange={(e) => setNewLocation(e.target.value)} />
               </div>
 
               <button type="submit" className="btn btn-primary" style={{ height: "40px", marginTop: "8px" }} disabled={createLoading}>

@@ -365,17 +365,32 @@ def test_dispatch_outbox_message_failure(mock_db):
 
 def test_celery_task_queue_alignment():
     """
-    Ensure every registered task is routed to an explicit queue that is consumed
-    by the worker command in docker-compose.yml (-Q default,messages,qualification).
+    Ensure every registered task and periodic beat schedule is routed to an explicit queue
+    that is actively consumed by the worker command in docker-compose.yml.
+    Catches mismatched queue names, missing queue subscriptions, or unconsumed queues.
     """
+    import re
+    from pathlib import Path
     from app.tasks.celery_app import celery_app
 
-    worker_queues = {"default", "messages", "qualification"}
+    # Read docker-compose.yml from repository root
+    compose_path = Path(__file__).resolve().parents[3] / "docker-compose.yml"
+    assert compose_path.exists(), f"docker-compose.yml not found at {compose_path}"
+
+    compose_text = compose_path.read_text(encoding="utf-8")
+    # Match: -Q default,messages,qualification,...
+    q_match = re.search(r"-Q\s+([a-zA-Z0-9_,]+)", compose_text)
+    assert q_match, "Worker -Q queue flag not found in docker-compose.yml!"
+    worker_queues = {q.strip() for q in q_match.group(1).split(",") if q.strip()}
+
+    # Verify expected queues are consumed by worker
+    for expected_q in ["default", "messages", "qualification", "outbox", "conversation", "sync"]:
+        assert expected_q in worker_queues, f"Worker does not consume required queue: {expected_q}"
 
     # 1. Default queue must be in worker queues (never default to unconsumed 'celery')
     assert celery_app.conf.task_default_queue in worker_queues
 
-    # 2. Inspect registered tasks
+    # 2. Inspect all registered tasks
     tasks = [
         process_outbox_batch,
         detect_stalled_leads_batch,
@@ -408,6 +423,10 @@ def test_celery_task_queue_alignment():
         assert queue in worker_queues, (
             f"Beat schedule {schedule_name} routes to {queue}, not in worker queues {worker_queues}"
         )
+
+    # 5. Catch mismatched queue names test
+    mismatched_test_queue = "mismatched_unconsumed_queue_test"
+    assert mismatched_test_queue not in worker_queues
 
 
 def test_compose_settings_mapping():

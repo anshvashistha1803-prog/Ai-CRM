@@ -33,11 +33,15 @@ class LeadCreateRequest(BaseSchema):
     move_in_timeline: str | None = Field(default=None, max_length=50)
 
     notes: str | None = None
+    raw_message_text: str | None = None
+    messages: list[str] | None = None
     assigned_agent_id: uuid.UUID | None = None
 
     # DPDP / GDPR consent tracking
     consent_granted: bool = True
     consent_channel: str = Field(default="FORM", max_length=50)
+    consent_type: str = Field(default="MARKETING", max_length=50)
+    consent_text: str | None = None
     consent_ip: str | None = None
     consent_user_agent: str | None = None
 

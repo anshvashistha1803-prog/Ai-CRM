@@ -101,7 +101,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: celery -A app.tasks.celery_app worker -l info -c 4 -Q default,messages,qualification
+    command: celery -A app.tasks.celery_app worker -l info -c 4 -Q default,messages,qualification,outbox,conversation,sync
 
   celery-beat:
     build:

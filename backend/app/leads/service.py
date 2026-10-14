@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.dependencies import TenantContext, UserRole
 from app.core.exceptions import (
     DuplicateLeadError,
+    InvalidTransitionError,
     NotFoundError,
     PermissionDeniedError,
 )
@@ -30,7 +31,7 @@ from app.leads.schemas import (
     LeadResponse,
     LeadUpdateRequest,
 )
-from app.leads.state_machine import LeadStage, validate_transition
+from app.leads.state_machine import LeadHealth, LeadStage, validate_transition
 from app.users.models import User
 
 logger = structlog.get_logger()
@@ -96,6 +97,32 @@ class LeadService:
         phone_enc = encrypt_field(norm_phone)
         email_enc = encrypt_field(norm_email) if norm_email else None
 
+        # Determine initial raw_message_text for AI qualification & conversation history
+        raw_msg = payload.raw_message_text
+        if not raw_msg and payload.messages:
+            raw_msg = "\n".join(payload.messages)
+        if not raw_msg:
+            raw_msg = payload.notes
+        if not raw_msg:
+            # Synthesize inquiry context from provided structured criteria
+            inquiry_parts = []
+            if payload.purpose:
+                inquiry_parts.append(f"Looking to {payload.purpose.lower()}")
+            if payload.bhk:
+                inquiry_parts.append(f"{payload.bhk} BHK")
+            if payload.property_type:
+                inquiry_parts.append(payload.property_type.lower())
+            if payload.preferred_location:
+                inquiry_parts.append(f"in {payload.preferred_location}")
+            if payload.budget_max:
+                inquiry_parts.append(f"budget up to {payload.budget_max}")
+            if payload.move_in_timeline:
+                inquiry_parts.append(f"timeline {payload.move_in_timeline}")
+            if inquiry_parts:
+                raw_msg = f"Client inquiry: {', '.join(inquiry_parts)}."
+            else:
+                raw_msg = f"Lead created via {payload.source} for {payload.full_name}."
+
         now = datetime.now(UTC)
         lead = Lead(
             id=uuid.uuid4(),
@@ -116,10 +143,11 @@ class LeadService:
             purpose=payload.purpose,
             move_in_timeline=payload.move_in_timeline,
             notes=payload.notes,
+            raw_message_text=raw_msg,
             assigned_agent_id=assigned_agent_id,
             stage=LeadStage.NEW.value,
             lead_health="UNKNOWN",
-            automation_status="ACTIVE",
+            automation_status="ACTIVE" if payload.consent_granted else "PAUSED",
             do_not_contact=False,
             is_deleted=False,
             created_at=now,
@@ -133,34 +161,55 @@ class LeadService:
                 self.db.add(lead)
                 await self.db.flush()
 
-                # Consent logging
-                if payload.consent_granted:
-                    consent = ConsentRecord(
-                        id=uuid.uuid4(),
-                        tenant_id=self.context.tenant_id,
-                        lead_id=lead.id,
-                        consent_type="MARKETING",
-                        granted=True,
-                        channel=payload.consent_channel,
-                        ip_address=payload.consent_ip,
-                        user_agent=payload.consent_user_agent,
-                        created_at=now,
-                    )
-                    self.db.add(consent)
+                # Consent logging: Always record initial consent state (granted or denied/absent)
+                consent = ConsentRecord(
+                    id=uuid.uuid4(),
+                    tenant_id=self.context.tenant_id,
+                    lead_id=lead.id,
+                    consent_type=payload.consent_type or ("MARKETING" if payload.consent_granted else "NONE"),
+                    granted=bool(payload.consent_granted),
+                    channel=payload.consent_channel or "FORM",
+                    ip_address=payload.consent_ip,
+                    user_agent=payload.consent_user_agent,
+                    consent_text=payload.consent_text,
+                    created_at=now,
+                )
+                self.db.add(consent)
 
                 # Timeline activity log
                 activity = LeadActivity(
                     id=uuid.uuid4(),
                     tenant_id=self.context.tenant_id,
                     lead_id=lead.id,
-                    actor_id=self.context.user_id,
-                    actor_type="USER",
+                    actor_id=self.context.user_id if (self.context and self.context.user_id) else None,
+                    actor_type="USER" if (self.context and self.context.user_id) else "SYSTEM",
                     activity_type="LEAD_CREATED",
                     description=f"Lead created via {payload.source}",
                     metadata_={"source": payload.source, "initial_stage": lead.stage},
                     created_at=now,
                 )
                 self.db.add(activity)
+
+                # Transactional outbox: automatically enqueue AI qualification
+                from app.messaging.outbox_service import OutboxService
+
+                outbox_svc = OutboxService(self.db)
+                outbox_messages = payload.messages or ([raw_msg] if raw_msg else [])
+                await outbox_svc.enqueue_message(
+                    tenant_id=self.context.tenant_id,
+                    event_type="AI_QUALIFICATION_REQUESTED",
+                    aggregate_type="LEAD",
+                    aggregate_id=lead.id,
+                    payload={
+                        "lead_id": str(lead.id),
+                        "source": payload.source,
+                        "action": "GENERATE_PROPOSAL",
+                        "message_text": raw_msg,
+                        "messages": outbox_messages,
+                    },
+                    idempotency_key=f"qual-start-{lead.id}",
+                )
+
                 await self.db.flush()
         except IntegrityError as exc:
             err_msg = str(exc).lower()
@@ -452,13 +501,88 @@ class LeadService:
             is_system=is_system,
         )
 
+        # 2. Qualification integrity validation
+        if to_stage == LeadStage.QUALIFIED and from_stage != LeadStage.QUALIFIED:
+            from app.qualification.models import LeadQualificationProposal
+
+            prop_stmt = select(LeadQualificationProposal).where(
+                LeadQualificationProposal.lead_id == lead.id,
+                LeadQualificationProposal.tenant_id == self.context.tenant_id,
+                LeadQualificationProposal.status == "ACCEPTED",
+            )
+            prop_res = await self.db.execute(prop_stmt)
+            first_prop = prop_res.scalars().first()
+            has_accepted_proposal = (
+                isinstance(first_prop, LeadQualificationProposal)
+                and first_prop.status == "ACCEPTED"
+            )
+
+            has_completed_conversation = (
+                isinstance(lead.score_breakdown, dict)
+                and lead.score_breakdown.get("conversation_state", {}).get("current_node") == "COMPLETED"
+            )
+
+            is_returning_from_downstream = (
+                from_stage in (LeadStage.SITE_VISIT_SCHEDULED, LeadStage.NEGOTIATION, LeadStage.STALLED)
+                and lead.intent_score is not None
+                and lead.lead_health not in (None, "UNKNOWN", LeadHealth.UNKNOWN.value)
+            )
+
+            if not (has_accepted_proposal or has_completed_conversation or is_returning_from_downstream):
+                raise InvalidTransitionError(
+                    f"Cannot transition lead to {LeadStage.QUALIFIED.value} without accepted qualification evidence. "
+                    "A qualification proposal must be accepted or conversational qualification completed."
+                )
+
         now = datetime.now(UTC)
 
         async with self.db.begin_nested() if self.db.in_transaction() else self.db.begin():
             lead.stage = to_stage.value
             lead.last_activity_at = now
 
-            # 2. Activity timeline entry
+            if to_stage == LeadStage.QUALIFIED and from_stage != LeadStage.QUALIFIED:
+                # 3. Deterministic score evaluation if not already evaluated
+                if lead.intent_score is None or lead.lead_health in (None, "UNKNOWN", LeadHealth.UNKNOWN.value):
+                    from app.scoring.engine import ScoringEngine
+
+                    answers = None
+                    if isinstance(lead.score_breakdown, dict):
+                        answers = (
+                            lead.score_breakdown.get("answers")
+                            or lead.score_breakdown.get("conversation_state", {}).get("answers")
+                        )
+                    score_out = ScoringEngine.evaluate(lead, answers=answers)
+                    lead.intent_score = score_out.intent_score
+                    lead.lead_health = score_out.lead_health
+                    if isinstance(lead.score_breakdown, dict):
+                        score_payload = score_out.breakdown
+                        if (
+                            "conversation_state" in lead.score_breakdown
+                            and "conversation_state" not in score_payload
+                        ):
+                            score_payload["conversation_state"] = lead.score_breakdown["conversation_state"]
+                        lead.score_breakdown = score_payload
+                    else:
+                        lead.score_breakdown = score_out.breakdown
+
+                # 4. Enqueue idempotent property matching request via transactional outbox
+                from app.messaging.outbox_service import OutboxService
+
+                outbox_svc = OutboxService(self.db)
+                await outbox_svc.enqueue_message(
+                    tenant_id=lead.tenant_id,
+                    event_type="MATCH_COMPUTATION_REQUESTED",
+                    aggregate_type="LEAD",
+                    aggregate_id=lead.id,
+                    payload={
+                        "lead_id": str(lead.id),
+                        "score": lead.intent_score,
+                        "health": lead.lead_health,
+                    },
+                    idempotency_key=f"match-compute-{lead.id}",
+                )
+
+            # 5. Activity timeline entry
             activity = LeadActivity(
                 id=uuid.uuid4(),
                 tenant_id=self.context.tenant_id,
@@ -471,6 +595,8 @@ class LeadService:
                     "from_stage": from_stage.value,
                     "to_stage": to_stage.value,
                     "reason": reason,
+                    "intent_score": lead.intent_score,
+                    "lead_health": lead.lead_health,
                 },
                 created_at=now,
             )

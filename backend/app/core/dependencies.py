@@ -44,7 +44,7 @@ _ROLE_HIERARCHY: list[UserRole] = [
 class TenantContext:
     """Immutable context injected into every service call."""
 
-    user_id: uuid.UUID
+    user_id: uuid.UUID | None
     tenant_id: uuid.UUID
     role: UserRole
 

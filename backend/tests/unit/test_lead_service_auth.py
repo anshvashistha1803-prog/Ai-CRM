@@ -474,3 +474,303 @@ class TestLeadStageTransitions:
         assert res.stage == "STALLED"
         assert lead.stage == "STALLED"
 
+
+@pytest.mark.asyncio
+class TestLeadQualificationStageEnforcement:
+    """Regression test suite for qualification integrity and atomic outbox property matching trigger."""
+
+    def _setup_mock_execute(self, lead, proposal=None, existing_outbox=None):
+        async def _execute(stmt, *args, **kwargs):
+            res = MagicMock()
+            stmt_str = str(stmt).lower()
+            if "lead_qualification_proposals" in stmt_str:
+                res.scalars.return_value.first.return_value = proposal
+                res.scalars.return_value.all.return_value = [proposal] if proposal else []
+            elif "outbox_messages" in stmt_str:
+                res.scalars.return_value.first.return_value = existing_outbox
+                res.scalars.return_value.all.return_value = [existing_outbox] if existing_outbox else []
+            elif "leads" in stmt_str:
+                res.scalars.return_value.first.return_value = lead
+                res.scalars.return_value.all.return_value = [lead] if lead else []
+            else:
+                res.scalars.return_value.first.return_value = None
+                res.scalars.return_value.all.return_value = []
+            return res
+        return _execute
+
+    async def test_qualifying_to_qualified_without_evidence_rejected(self, mock_db, tenant_a, agent_1_id):
+        lead = _create_mock_lead(tenant_id=tenant_a, assigned_agent_id=agent_1_id)
+        lead.stage = "QUALIFYING"
+        lead.score_breakdown = None
+
+        mock_db.execute.side_effect = self._setup_mock_execute(lead, proposal=None)
+
+        context = TenantContext(user_id=agent_1_id, tenant_id=tenant_a, role=UserRole.AGENT)
+        service = LeadService(mock_db, context)
+
+        from app.core.exceptions import InvalidTransitionError
+        from app.leads.state_machine import LeadStage
+
+        with pytest.raises(InvalidTransitionError, match="without accepted qualification evidence"):
+            await service.transition_stage(lead.id, LeadStage.QUALIFIED)
+
+        assert lead.stage == "QUALIFYING"
+        # Ensure no activity or outbox was added
+        for call_args in mock_db.add.call_args_list:
+            added = call_args[0][0]
+            from app.messaging.models import OutboxMessage
+            assert not isinstance(added, OutboxMessage)
+
+    async def test_qualifying_to_qualified_with_pending_proposal_rejected(self, mock_db, tenant_a, agent_1_id):
+        lead = _create_mock_lead(tenant_id=tenant_a, assigned_agent_id=agent_1_id)
+        lead.stage = "QUALIFYING"
+        lead.score_breakdown = None
+
+        from app.qualification.models import LeadQualificationProposal
+        pending_prop = LeadQualificationProposal(
+            id=uuid.uuid4(),
+            lead_id=lead.id,
+            tenant_id=tenant_a,
+            status="PENDING_REVIEW",
+            proposed_by="AI",
+            budget_max=15000000,
+            confidence={"budget": 0.8},
+        )
+
+        mock_db.execute.side_effect = self._setup_mock_execute(lead, proposal=pending_prop)
+
+        context = TenantContext(user_id=agent_1_id, tenant_id=tenant_a, role=UserRole.AGENT)
+        service = LeadService(mock_db, context)
+
+        from app.core.exceptions import InvalidTransitionError
+        from app.leads.state_machine import LeadStage
+
+        with pytest.raises(InvalidTransitionError, match="without accepted qualification evidence"):
+            await service.transition_stage(lead.id, LeadStage.QUALIFIED)
+
+        assert lead.stage == "QUALIFYING"
+
+    async def test_qualifying_to_qualified_with_rejected_proposal_rejected(self, mock_db, tenant_a, agent_1_id):
+        lead = _create_mock_lead(tenant_id=tenant_a, assigned_agent_id=agent_1_id)
+        lead.stage = "QUALIFYING"
+        lead.score_breakdown = None
+
+        from app.qualification.models import LeadQualificationProposal
+        rejected_prop = LeadQualificationProposal(
+            id=uuid.uuid4(),
+            lead_id=lead.id,
+            tenant_id=tenant_a,
+            status="REJECTED",
+            proposed_by="AI",
+            confidence={},
+        )
+
+        mock_db.execute.side_effect = self._setup_mock_execute(lead, proposal=rejected_prop)
+
+        context = TenantContext(user_id=agent_1_id, tenant_id=tenant_a, role=UserRole.AGENT)
+        service = LeadService(mock_db, context)
+
+        from app.core.exceptions import InvalidTransitionError
+        from app.leads.state_machine import LeadStage
+
+        with pytest.raises(InvalidTransitionError, match="without accepted qualification evidence"):
+            await service.transition_stage(lead.id, LeadStage.QUALIFIED)
+
+        assert lead.stage == "QUALIFYING"
+
+    async def test_qualifying_to_qualified_with_accepted_proposal_succeeds_and_enqueues_match(
+        self, mock_db, tenant_a, agent_1_id
+    ):
+        lead = _create_mock_lead(tenant_id=tenant_a, assigned_agent_id=agent_1_id)
+        lead.stage = "QUALIFYING"
+        lead.intent_score = None
+        lead.lead_health = "UNKNOWN"
+        lead.score_breakdown = None
+
+        from app.qualification.models import LeadQualificationProposal
+        accepted_prop = LeadQualificationProposal(
+            id=uuid.uuid4(),
+            lead_id=lead.id,
+            tenant_id=tenant_a,
+            status="ACCEPTED",
+            proposed_by="AI",
+            budget_min=5000000,
+            budget_max=10000000,
+            property_type="APARTMENT",
+            bhk=3,
+            preferred_location="Whitefield",
+            purpose="BUY",
+            move_in_timeline="IMMEDIATE",
+            confidence={"budget": 0.95},
+        )
+
+        mock_db.execute.side_effect = self._setup_mock_execute(lead, proposal=accepted_prop)
+
+        context = TenantContext(user_id=agent_1_id, tenant_id=tenant_a, role=UserRole.AGENT)
+        service = LeadService(mock_db, context)
+
+        from app.leads.state_machine import LeadStage
+        res = await service.transition_stage(lead.id, LeadStage.QUALIFIED, reason="Proposal accepted")
+
+        assert res.stage == "QUALIFIED"
+        assert lead.stage == "QUALIFIED"
+        # Deterministic score & health persisted within transaction
+        assert lead.intent_score is not None
+        assert lead.intent_score > 0
+        assert lead.lead_health in ("HOT", "WARM", "COLD", "INSUFFICIENT_DATA")
+        assert lead.lead_health != "UNKNOWN"
+        assert lead.score_breakdown is not None
+
+        # Verify Outbox message enqueued
+        from app.messaging.models import OutboxMessage
+        added_objects = [call_args[0][0] for call_args in mock_db.add.call_args_list]
+        outbox_msgs = [obj for obj in added_objects if isinstance(obj, OutboxMessage)]
+        assert len(outbox_msgs) == 1
+        msg = outbox_msgs[0]
+        assert msg.event_type == "MATCH_COMPUTATION_REQUESTED"
+        assert msg.aggregate_type == "LEAD"
+        assert msg.aggregate_id == str(lead.id)
+        assert msg.idempotency_key == f"match-compute-{lead.id}"
+        assert msg.payload["lead_id"] == str(lead.id)
+        assert msg.payload["score"] == lead.intent_score
+
+    async def test_qualifying_to_qualified_with_completed_conversation_succeeds(
+        self, mock_db, tenant_a, agent_1_id
+    ):
+        lead = _create_mock_lead(tenant_id=tenant_a, assigned_agent_id=agent_1_id)
+        lead.stage = "QUALIFYING"
+        lead.score_breakdown = {
+            "conversation_state": {
+                "current_node": "COMPLETED",
+                "answers": {"intent": "BUY", "property_type": "APARTMENT"},
+            }
+        }
+        lead.intent_score = 65
+        lead.lead_health = "WARM"
+
+        mock_db.execute.side_effect = self._setup_mock_execute(lead, proposal=None)
+
+        context = TenantContext(user_id=agent_1_id, tenant_id=tenant_a, role=UserRole.AGENT)
+        service = LeadService(mock_db, context)
+
+        from app.leads.state_machine import LeadStage
+        res = await service.transition_stage(lead.id, LeadStage.QUALIFIED)
+
+        assert res.stage == "QUALIFIED"
+        assert lead.stage == "QUALIFIED"
+        # Verify outbox event was enqueued
+        from app.messaging.models import OutboxMessage
+        added_objects = [call_args[0][0] for call_args in mock_db.add.call_args_list]
+        outbox_msgs = [obj for obj in added_objects if isinstance(obj, OutboxMessage)]
+        assert len(outbox_msgs) == 1
+        assert outbox_msgs[0].event_type == "MATCH_COMPUTATION_REQUESTED"
+
+    async def test_manager_rollback_from_site_visit_to_qualified_succeeds(
+        self, mock_db, tenant_a
+    ):
+        lead = _create_mock_lead(tenant_id=tenant_a)
+        lead.stage = "SITE_VISIT_SCHEDULED"
+        lead.intent_score = 80
+        lead.lead_health = "HOT"
+
+        mock_db.execute.side_effect = self._setup_mock_execute(lead, proposal=None)
+
+        context = TenantContext(user_id=uuid.uuid4(), tenant_id=tenant_a, role=UserRole.MANAGER)
+        service = LeadService(mock_db, context)
+
+        from app.leads.state_machine import LeadStage
+        res = await service.transition_stage(lead.id, LeadStage.QUALIFIED, reason="Visit cancelled by client")
+
+        assert res.stage == "QUALIFIED"
+        assert lead.stage == "QUALIFIED"
+        assert lead.intent_score == 80
+        assert lead.lead_health == "HOT"
+
+    async def test_agent_rollback_from_site_visit_to_qualified_rejected(
+        self, mock_db, tenant_a, agent_1_id
+    ):
+        lead = _create_mock_lead(tenant_id=tenant_a, assigned_agent_id=agent_1_id)
+        lead.stage = "SITE_VISIT_SCHEDULED"
+        lead.intent_score = 80
+        lead.lead_health = "HOT"
+
+        mock_db.execute.side_effect = self._setup_mock_execute(lead, proposal=None)
+
+        context = TenantContext(user_id=agent_1_id, tenant_id=tenant_a, role=UserRole.AGENT)
+        service = LeadService(mock_db, context)
+
+        from app.core.exceptions import InvalidTransitionError
+        from app.leads.state_machine import LeadStage
+
+        with pytest.raises(InvalidTransitionError, match="requires MANAGER role"):
+            await service.transition_stage(lead.id, LeadStage.QUALIFIED)
+
+    async def test_repeated_transition_to_qualified_does_not_duplicate_outbox(
+        self, mock_db, tenant_a, agent_1_id
+    ):
+        lead = _create_mock_lead(tenant_id=tenant_a, assigned_agent_id=agent_1_id)
+        lead.stage = "QUALIFIED"
+        lead.intent_score = 75
+        lead.lead_health = "WARM"
+
+        mock_db.execute.side_effect = self._setup_mock_execute(lead, proposal=None)
+
+        context = TenantContext(user_id=agent_1_id, tenant_id=tenant_a, role=UserRole.AGENT)
+        service = LeadService(mock_db, context)
+
+        from app.leads.state_machine import LeadStage
+        res = await service.transition_stage(lead.id, LeadStage.QUALIFIED)
+
+        assert res.stage == "QUALIFIED"
+        # No-op: should not add any outbox message
+        added_objects = [call_args[0][0] for call_args in mock_db.add.call_args_list]
+        from app.messaging.models import OutboxMessage
+        outbox_msgs = [obj for obj in added_objects if isinstance(obj, OutboxMessage)]
+        assert len(outbox_msgs) == 0
+
+    async def test_outbox_deduplication_when_event_already_exists(
+        self, mock_db, tenant_a, agent_1_id
+    ):
+        lead = _create_mock_lead(tenant_id=tenant_a, assigned_agent_id=agent_1_id)
+        lead.stage = "QUALIFYING"
+        lead.intent_score = 70
+        lead.lead_health = "HOT"
+
+        from app.qualification.models import LeadQualificationProposal
+        accepted_prop = LeadQualificationProposal(
+            id=uuid.uuid4(),
+            lead_id=lead.id,
+            tenant_id=tenant_a,
+            status="ACCEPTED",
+            proposed_by="AI",
+            confidence={},
+        )
+
+        from app.messaging.models import OutboxMessage
+        existing_msg = OutboxMessage(
+            id=uuid.uuid4(),
+            tenant_id=tenant_a,
+            event_type="MATCH_COMPUTATION_REQUESTED",
+            aggregate_type="LEAD",
+            aggregate_id=str(lead.id),
+            payload={"lead_id": str(lead.id)},
+            status="PENDING",
+            idempotency_key=f"match-compute-{lead.id}",
+        )
+
+        mock_db.execute.side_effect = self._setup_mock_execute(
+            lead, proposal=accepted_prop, existing_outbox=existing_msg
+        )
+
+        context = TenantContext(user_id=agent_1_id, tenant_id=tenant_a, role=UserRole.AGENT)
+        service = LeadService(mock_db, context)
+
+        from app.leads.state_machine import LeadStage
+        res = await service.transition_stage(lead.id, LeadStage.QUALIFIED)
+
+        assert res.stage == "QUALIFIED"
+        # Since existing_outbox was returned by query, OutboxService did not add a new OutboxMessage
+        added_objects = [call_args[0][0] for call_args in mock_db.add.call_args_list]
+        outbox_msgs = [obj for obj in added_objects if isinstance(obj, OutboxMessage)]
+        assert len(outbox_msgs) == 0
+

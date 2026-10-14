@@ -16,16 +16,26 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import NotFoundError
-from app.leads.models import Lead, LeadActivity
+from app.core.security import decrypt_field
+from app.leads.models import ConsentRecord, Lead, LeadActivity
 from app.leads.state_machine import AutomationStatus, LeadStage
+from app.messaging.models import OutboxMessage
 from app.messaging.outbox_service import OutboxService
+from app.qualification.models import LeadQualificationProposal
 from app.scoring.engine import ScoringEngine
+from app.tenants.models import Tenant
 
 logger = structlog.get_logger()
 
 SKIP_TOKENS = frozenset({
     "skip", "pass", "next", "nahi", "no", "chodo", "leave", "leave it",
     "na", "none", "not now", "skip this", "baad mein", "later"
+})
+
+OPT_OUT_TOKENS = frozenset({
+    "stop", "unsubscribe", "opt out", "optout", "cancel", "block",
+    "don't message", "dont message", "do not message", "mat bhejo",
+    "band karo", "stop messaging", "remove me", "do not contact"
 })
 
 HUMAN_REQUEST_TOKENS = frozenset({
@@ -39,6 +49,7 @@ HINGLISH_INDICATORS = frozenset({
     "ke", "kothi", "gaj", "bhai", "haan", "nahi", "accha", "dijiye", "hum", "aap",
     "namaste", "kitna", "dehradun"
 })
+
 
 
 class ConversationResponse:
@@ -80,7 +91,12 @@ class QualificationConversationService:
         cleaned = text.strip().lower()
         return any(tok in cleaned for tok in HUMAN_REQUEST_TOKENS)
 
+    def is_opt_out(self, text: str) -> bool:
+        cleaned = text.strip().lower()
+        return cleaned in OPT_OUT_TOKENS or any(tok in cleaned for tok in OPT_OUT_TOKENS)
+
     def extract_entities(self, text: str, existing_answers: dict[str, Any]) -> dict[str, Any]:
+
         """Greedily extract real estate criteria from text without overwriting confirmed answers."""
         extracted: dict[str, Any] = {}
         t_lower = text.lower()
@@ -144,8 +160,9 @@ class QualificationConversationService:
             extracted["move_in_timeline"] = "> 3 MONTHS"
 
         # 7. Purpose
-        if any(w in t_lower for w in ["primary", "self use", "rehna", "living", "family"]):
+        if any(w in t_lower for w in ["primary", "self use", "rehna", "living", "family", "residence", "self"]):
             extracted["purpose"] = "PRIMARY RESIDENCE"
+
         elif any(w in t_lower for w in ["second home", "vacation", "holiday home"]):
             extracted["purpose"] = "SECOND HOME"
         elif any(w in t_lower for w in ["invest", "investment", "returns"]):
@@ -185,12 +202,287 @@ class QualificationConversationService:
         if area_match:
             extracted["built_up_area"] = area_match.group(0)
 
-        # Merge extracted with existing
+        # Merge extracted with existing, honoring chronological corrections from latest message
         merged = dict(existing_answers)
         for k, v in extracted.items():
-            if k not in merged or not merged[k]:
+            if v is not None:
                 merged[k] = v
         return merged
+
+
+    def _resolve_recipient_phone(self, lead: Lead, sender_phone: str | None = None) -> str | None:
+        """Resolve unencrypted phone number for outbound dispatch."""
+        if sender_phone:
+            return sender_phone
+        if not lead.phone_e164_enc:
+            return None
+        try:
+            return decrypt_field(lead.phone_e164_enc)
+        except Exception:
+            return lead.phone_e164_enc if not lead.phone_e164_enc.startswith("enc:") else None
+
+    async def _seed_answers(self, lead: Lead, existing_answers: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Seed conversation answers from lead record and any active proposal."""
+        answers = dict(existing_answers or {})
+
+        # 1. Lead intent / purpose
+        if "intent" not in answers:
+            if getattr(lead, "intent", None):
+                answers["intent"] = str(lead.intent).upper()
+            elif lead.purpose:
+                p_upper = lead.purpose.upper()
+                if "SELL" in p_upper:
+                    answers["intent"] = "SELL"
+                elif "RENT" in p_upper:
+                    answers["intent"] = "RENT"
+                elif any(k in p_upper for k in ["BUY", "INVEST", "RESIDENCE", "PURCHASE"]):
+                    answers["intent"] = "BUY"
+            elif lead.raw_message_text:
+                rmt = lead.raw_message_text.lower()
+                if any(w in rmt for w in ["rent", "rental", "lease", "kiraya"]):
+                    answers["intent"] = "RENT"
+                elif any(w in rmt for w in ["sell", "listing", "list my", "bechna"]):
+                    answers["intent"] = "SELL"
+                elif any(w in rmt for w in ["buy", "purchase", "kharidna"]):
+                    answers["intent"] = "BUY"
+
+        # 2. Canonical lead attributes
+        if "property_type" not in answers and lead.property_type:
+            answers["property_type"] = lead.property_type.upper()
+        if "bhk" not in answers and lead.bhk is not None:
+            answers["bhk"] = lead.bhk
+        if "preferred_location" not in answers and lead.preferred_location:
+            answers["preferred_location"] = lead.preferred_location
+        if "budget_max" not in answers and lead.budget_max is not None:
+            answers["budget_max"] = lead.budget_max
+        if "budget_min" not in answers and lead.budget_min is not None:
+            answers["budget_min"] = lead.budget_min
+        if "move_in_timeline" not in answers and lead.move_in_timeline:
+            answers["move_in_timeline"] = lead.move_in_timeline
+        if "purpose" not in answers and lead.purpose:
+            answers["purpose"] = lead.purpose
+
+        # 3. Seed from active proposal if criteria missing on lead record
+        prop_stmt = (
+            select(LeadQualificationProposal)
+            .where(
+                LeadQualificationProposal.tenant_id == lead.tenant_id,
+                LeadQualificationProposal.lead_id == lead.id,
+                LeadQualificationProposal.status.in_(["PENDING_REVIEW", "ACCEPTED"]),
+            )
+            .order_by(LeadQualificationProposal.created_at.desc())
+        )
+        prop_res = await self.db.execute(prop_stmt)
+        proposal = prop_res.scalars().first()
+        if proposal:
+            if "property_type" not in answers and proposal.property_type:
+                answers["property_type"] = proposal.property_type.upper()
+            if "bhk" not in answers and proposal.bhk is not None:
+                answers["bhk"] = proposal.bhk
+            if "preferred_location" not in answers and proposal.preferred_location:
+                answers["preferred_location"] = proposal.preferred_location
+            if "budget_max" not in answers and proposal.budget_max is not None:
+                answers["budget_max"] = proposal.budget_max
+            if "budget_min" not in answers and proposal.budget_min is not None:
+                answers["budget_min"] = proposal.budget_min
+            if "move_in_timeline" not in answers and proposal.move_in_timeline:
+                answers["move_in_timeline"] = proposal.move_in_timeline
+            if "purpose" not in answers and proposal.purpose:
+                answers["purpose"] = proposal.purpose
+
+        return answers
+
+    async def _sync_answers_to_proposal(self, lead: Lead, answers: dict[str, Any]) -> None:
+        """Update any active PENDING_REVIEW proposal with extracted criteria, preserving nulls."""
+        stmt = (
+            select(LeadQualificationProposal)
+            .where(
+                LeadQualificationProposal.tenant_id == lead.tenant_id,
+                LeadQualificationProposal.lead_id == lead.id,
+                LeadQualificationProposal.status == "PENDING_REVIEW",
+            )
+            .order_by(LeadQualificationProposal.created_at.desc())
+        )
+        res = await self.db.execute(stmt)
+        proposal = res.scalars().first()
+        if not proposal:
+            return
+
+        if answers.get("property_type") and answers["property_type"] != "SKIPPED":
+            proposal.property_type = answers["property_type"]
+        if answers.get("bhk") and answers["bhk"] != "SKIPPED":
+            with contextlib.suppress(ValueError, TypeError):
+                proposal.bhk = int(answers["bhk"])
+        if answers.get("preferred_location") and answers["preferred_location"] != "SKIPPED":
+            proposal.preferred_location = answers["preferred_location"]
+        if answers.get("budget_max") and answers["budget_max"] != "SKIPPED":
+            with contextlib.suppress(ValueError, TypeError):
+                proposal.budget_max = int(answers["budget_max"])
+        if answers.get("budget_min") and answers["budget_min"] != "SKIPPED":
+            with contextlib.suppress(ValueError, TypeError):
+                proposal.budget_min = int(answers["budget_min"])
+        if answers.get("purpose") and answers["purpose"] != "SKIPPED":
+            proposal.purpose = answers["purpose"]
+        if answers.get("move_in_timeline") and answers["move_in_timeline"] != "SKIPPED":
+            proposal.move_in_timeline = answers["move_in_timeline"]
+
+    async def check_messaging_eligibility(
+        self,
+        lead: Lead,
+        tenant: Tenant | None = None,
+    ) -> tuple[bool, str]:
+        """
+        Determine whether the lead has a valid WhatsApp-capable phone number,
+        necessary consent, active automation status, and tenant configuration.
+        Returns (is_eligible, reason).
+        """
+        if lead.is_deleted:
+            return False, "lead_is_deleted"
+
+        if lead.do_not_contact:
+            return False, "lead_do_not_contact"
+
+        if lead.automation_status in {
+            AutomationStatus.HUMAN_TAKEOVER.value,
+            AutomationStatus.PAUSED.value,
+            AutomationStatus.OPTED_OUT.value,
+        }:
+            return False, f"lead_automation_{lead.automation_status}"
+
+        # Inbound automated qualification is intended for WEBSITE, META_LEAD_ADS, and WHATSAPP
+        if lead.source not in {"WEBSITE", "META_LEAD_ADS", "WHATSAPP"}:
+            return False, f"lead_source_ineligible_{lead.source}"
+
+        # Phone validation: decrypt and verify E.164
+        phone = self._resolve_recipient_phone(lead)
+        if not phone or not re.match(r"^\+[1-9]\d{6,14}$", phone):
+            return False, "invalid_or_missing_e164_phone"
+
+        # Preferred contact channel check
+        if lead.preferred_contact and lead.preferred_contact.upper() not in {"WHATSAPP", "PHONE", "CALL"}:
+            return False, f"preferred_contact_not_whatsapp_{lead.preferred_contact}"
+
+        # Consent verification
+        consent_stmt = (
+            select(ConsentRecord)
+            .where(
+                ConsentRecord.tenant_id == lead.tenant_id,
+                ConsentRecord.lead_id == lead.id,
+            )
+            .order_by(ConsentRecord.created_at.desc())
+        )
+        res = await self.db.execute(consent_stmt)
+        consents = res.scalars().all()
+        if not consents:
+            return False, "missing_consent_record"
+
+        latest_consent = consents[0]
+        if not latest_consent.granted:
+            return False, "consent_revoked_or_denied"
+
+        # Verify tenant WhatsApp configuration
+        t = tenant
+        if not t:
+            t_stmt = select(Tenant).where(Tenant.id == lead.tenant_id, Tenant.is_deleted.is_(False))
+            t_res = await self.db.execute(t_stmt)
+            t = t_res.scalars().first()
+
+        if not t or not t.is_active:
+            return False, "tenant_inactive_or_not_found"
+
+        has_waba = bool(t.whatsapp_phone_number_id) or bool((t.settings or {}).get("whatsapp_enabled"))
+        if not has_waba:
+            return False, "tenant_whatsapp_not_configured"
+
+        return True, "eligible"
+
+    async def schedule_initial_contact(self, lead_id: uuid.UUID) -> OutboxMessage | None:
+        """
+        Evaluate eligibility, seed initial answers, determine the first missing question,
+        and enqueue initial WhatsApp outreach template via transactional outbox.
+        """
+        stmt = select(Lead).where(Lead.id == lead_id, Lead.is_deleted.is_(False))
+        res = await self.db.execute(stmt)
+        lead = res.scalars().first()
+        if not lead:
+            logger.warning("schedule_initial_contact_lead_not_found", lead_id=str(lead_id))
+            return None
+
+        is_eligible, reason = await self.check_messaging_eligibility(lead)
+        if not is_eligible:
+            logger.info(
+                "whatsapp_qualification_initial_contact_ineligible",
+                lead_id=str(lead.id),
+                reason=reason,
+            )
+            return None
+
+        # Pre-seed answers from lead attributes and active proposals
+        answers = await self._seed_answers(lead)
+
+        # Sync pre-seeded criteria to existing proposal if any
+        await self._sync_answers_to_proposal(lead, answers)
+
+        lang = "EN"
+        next_node, first_question, is_complete = self._determine_next_step(answers, lang)
+        if is_complete:
+            logger.info("qualification_already_complete_no_initial_outreach_needed", lead_id=str(lead.id))
+            return None
+
+        recipient_phone = self._resolve_recipient_phone(lead)
+        if not recipient_phone:
+            logger.warning("missing_recipient_phone_for_initial_contact", lead_id=str(lead.id))
+            return None
+
+        now = datetime.now(UTC)
+
+        breakdown = lead.score_breakdown or {}
+        state_data = {
+            "current_node": next_node,
+            "answers": answers,
+            "turns_count": 0,
+            "language": lang,
+        }
+        breakdown["conversation_state"] = state_data
+        lead.score_breakdown = breakdown
+        lead.stage = LeadStage.QUALIFYING.value
+        lead.last_activity_at = now
+
+        activity = LeadActivity(
+            id=uuid.uuid4(),
+            tenant_id=lead.tenant_id,
+            lead_id=lead.id,
+            actor_type="SYSTEM",
+            activity_type="QUALIFICATION_STEP",
+            description=f"Scheduled initial WhatsApp outreach: {first_question[:100]}",
+            metadata_={"node": next_node, "template": "lead_qualification_intro"},
+            created_at=now,
+        )
+        self.db.add(activity)
+
+        outbox_svc = OutboxService(self.db)
+        outbox_msg = await outbox_svc.enqueue_message(
+            tenant_id=lead.tenant_id,
+            event_type="WHATSAPP_OUTBOUND_DISPATCH",
+            aggregate_type="LEAD",
+            aggregate_id=lead.id,
+            payload={
+                "recipient_phone": recipient_phone,
+                "template_name": "lead_qualification_intro",
+                "message_text": first_question,
+                "first_question": first_question,
+                "lead_name": lead.full_name,
+            },
+            idempotency_key=f"wa-init-{lead.id}",
+        )
+        await self.db.flush()
+        logger.info(
+            "whatsapp_qualification_initial_contact_scheduled",
+            lead_id=str(lead.id),
+            node=next_node,
+        )
+        return outbox_msg
+
 
     async def process_inbound_message(
         self,
@@ -228,11 +520,15 @@ class QualificationConversationService:
         now = datetime.now(UTC)
         lang = self.detect_language(message_text)
 
-        # 1. Check for immediate human takeover request
+        # 1. Check for opt-out request
+        if self.is_opt_out(message_text):
+            return await self._handle_opt_out(lead, lang, message_text, now)
+
+        # 2. Check for immediate human takeover request
         if self.is_human_request(message_text):
             return await self._handle_human_takeover(lead, lang, message_text, now)
 
-        # Retrieve saved conversation state from score_breakdown
+        # Retrieve saved conversation state from score_breakdown, seeded with lead attributes
         breakdown = lead.score_breakdown or {}
         state_data = breakdown.get("conversation_state") or {
             "current_node": "ENTRY",
@@ -240,7 +536,7 @@ class QualificationConversationService:
             "turns_count": 0,
             "language": lang,
         }
-        answers: dict[str, Any] = state_data.get("answers", {})
+        answers: dict[str, Any] = await self._seed_answers(lead, state_data.get("answers", {}))
         turns_count = state_data.get("turns_count", 0) + 1
 
         # Check skip
@@ -296,6 +592,9 @@ class QualificationConversationService:
         # Update Lead model scalar columns from answers
         self._sync_answers_to_lead(lead, answers)
 
+        # Sync updated answers to active qualification proposal (preserving nulls for skipped fields)
+        await self._sync_answers_to_proposal(lead, answers)
+
         # 2. Check for Rental Intent -> Politely Decline
         if answers.get("intent") == "RENT":
             return await self._handle_rental_declination(lead, lang, now)
@@ -336,7 +635,7 @@ class QualificationConversationService:
 
         # Enqueue outbound WhatsApp reply
         outbox_svc = OutboxService(self.db)
-        recipient_phone = sender_phone or (lead.phone_e164_enc if not lead.phone_e164_enc.startswith("enc:") else None)
+        recipient_phone = self._resolve_recipient_phone(lead, sender_phone)
         if recipient_phone:
             await outbox_svc.enqueue_message(
                 tenant_id=lead.tenant_id,
@@ -356,6 +655,7 @@ class QualificationConversationService:
             automation_status=lead.automation_status,
             is_completed=False,
         )
+
 
     def _determine_next_step(self, answers: dict[str, Any], lang: str) -> tuple[str, str, bool]:
         """
@@ -407,13 +707,14 @@ class QualificationConversationService:
                 )
                 return "AWAIT_SPECS", q, False
 
-            if p_type == "FLAT" and not (answers.get("bhk") or answers.get("specs")):
+            if p_type in ["FLAT", "APARTMENT"] and not (answers.get("bhk") or answers.get("specs")):
                 q = (
-                    "How many bedrooms (BHK) and preferred floor/view are you looking for in the flat?"
+                    "How many bedrooms (BHK) and preferred floor/view are you looking for in the flat/apartment?"
                     if not is_hinglish
-                    else "Flat में आपको कितने BHK और कौन सा floor preference रहेगा?"
+                    else "Flat/Apartment में आपको कितने BHK और कौन सा floor preference रहेगा?"
                 )
                 return "AWAIT_SPECS", q, False
+
 
             if p_type == "PENTHOUSE" and not (answers.get("specs") or answers.get("terrace")):
                 q = (
@@ -608,6 +909,74 @@ class QualificationConversationService:
             is_completed=True,
         )
 
+    async def _handle_opt_out(
+        self,
+        lead: Lead,
+        lang: str,
+        message_text: str,
+        now: datetime,
+    ) -> ConversationResponse:
+        """Immediately stop automated communication, revoke consent, and record opt-out."""
+        lead.do_not_contact = True
+        lead.stage = LeadStage.DO_NOT_CONTACT.value
+        lead.automation_status = AutomationStatus.OPTED_OUT.value
+        lead.last_activity_at = now
+
+        consent = ConsentRecord(
+            id=uuid.uuid4(),
+            tenant_id=lead.tenant_id,
+            lead_id=lead.id,
+            consent_type="WHATSAPP",
+            granted=False,
+            channel="WHATSAPP",
+            consent_text=f"User opted out via conversation: '{message_text}'",
+            created_at=now,
+        )
+        self.db.add(consent)
+
+        activity = LeadActivity(
+            id=uuid.uuid4(),
+            tenant_id=lead.tenant_id,
+            lead_id=lead.id,
+            actor_type="USER",
+            activity_type="CONSENT_REVOKED",
+            description="WhatsApp consent revoked by user opt-out in conversation",
+            metadata_={"trigger_text": message_text},
+            created_at=now,
+        )
+        self.db.add(activity)
+
+        is_hinglish = lang == "HINGLISH"
+        reply = (
+            "You have been successfully unsubscribed from automated messages. "
+            "We will no longer contact you via WhatsApp. Have a great day!"
+            if not is_hinglish
+            else "आपको automated messages से unsubscribe कर दिया गया है। "
+                 "हम आगे WhatsApp पर आपसे संपर्क नहीं करेंगे।"
+        )
+
+        outbox_svc = OutboxService(self.db)
+        recipient_phone = self._resolve_recipient_phone(lead)
+        if recipient_phone:
+            await outbox_svc.enqueue_message(
+                tenant_id=lead.tenant_id,
+                event_type="WHATSAPP_OUTBOUND_DISPATCH",
+                aggregate_type="LEAD",
+                aggregate_id=lead.id,
+                payload={"recipient_phone": recipient_phone, "message_text": reply},
+                idempotency_key=f"ai-optout-{lead.id}",
+            )
+
+        await self.db.flush()
+
+        return ConversationResponse(
+            reply_text=reply,
+            lead_id=lead.id,
+            stage=lead.stage,
+            automation_status=lead.automation_status,
+            is_completed=True,
+        )
+
     async def _handle_qualification_completion(
         self,
         lead: Lead,
@@ -618,7 +987,8 @@ class QualificationConversationService:
     ) -> ConversationResponse:
         """
         Generate structured summary, compute deterministic score, notify broker,
-        trigger Google Sheets sync, and stop bot automation.
+        trigger Google Sheets sync, update proposal in PENDING_REVIEW, and hand off to human.
+        Preserves the broker-review gate (stage stays QUALIFYING until broker reviews).
         """
         is_hinglish = lang == "HINGLISH"
         intent = answers.get("intent", "BUY")
@@ -663,9 +1033,9 @@ class QualificationConversationService:
                 f"• Verification: UNVERIFIED (Owner Provided)"
             )
 
-        # 2. Score Lead
+        # 2. Score Lead and maintain QUALIFYING stage (Broker Review Gate)
         score_out = ScoringEngine.evaluate(lead, answers)
-        lead.stage = LeadStage.QUALIFIED.value
+        lead.stage = LeadStage.QUALIFYING.value
         lead.intent_score = score_out.intent_score
         lead.lead_health = score_out.lead_health
         lead.notes = broker_summary
@@ -683,6 +1053,9 @@ class QualificationConversationService:
             "language": lang,
         }
         lead.score_breakdown = score_breakdown_payload
+
+        # Sync final answers to active proposal in PENDING_REVIEW status
+        await self._sync_answers_to_proposal(lead, answers)
 
         # 4. Activity Record
         activity = LeadActivity(
@@ -733,7 +1106,7 @@ class QualificationConversationService:
         )
 
         # 7. Outbox: Final WhatsApp Confirmation to Client
-        recipient_phone = sender_phone or (lead.phone_e164_enc if not lead.phone_e164_enc.startswith("enc:") else None)
+        recipient_phone = self._resolve_recipient_phone(lead, sender_phone)
         if recipient_phone:
             await outbox_svc.enqueue_message(
                 tenant_id=lead.tenant_id,
@@ -744,20 +1117,8 @@ class QualificationConversationService:
                 idempotency_key=f"ai-reply-final-{lead.id}",
             )
 
-        # 8. Outbox: Idempotent Automatic Property Matching Request
-        await outbox_svc.enqueue_message(
-            tenant_id=lead.tenant_id,
-            event_type="MATCH_COMPUTATION_REQUESTED",
-            aggregate_type="LEAD",
-            aggregate_id=lead.id,
-            payload={
-                "lead_id": str(lead.id),
-                "intent": intent,
-                "score": score_out.intent_score,
-                "health": score_out.lead_health,
-            },
-            idempotency_key=f"match-compute-{lead.id}",
-        )
+        # Note: MATCH_COMPUTATION_REQUESTED is NOT triggered here.
+        # It is strictly reserved for when a human broker reviews and accepts the proposal.
 
         await self.db.flush()
 
@@ -779,20 +1140,21 @@ class QualificationConversationService:
 
     def _sync_answers_to_lead(self, lead: Lead, answers: dict[str, Any]) -> None:
         """Map extracted answers to canonical scalar columns on Lead model."""
-        if answers.get("property_type"):
+        if answers.get("property_type") and answers["property_type"] != "SKIPPED":
             lead.property_type = answers["property_type"]
-        if answers.get("bhk"):
+        if answers.get("bhk") and answers["bhk"] != "SKIPPED":
             with contextlib.suppress(ValueError, TypeError):
                 lead.bhk = int(answers["bhk"])
-        if answers.get("budget_max"):
+        if answers.get("budget_max") and answers["budget_max"] != "SKIPPED":
             with contextlib.suppress(ValueError, TypeError):
                 lead.budget_max = int(answers["budget_max"])
-        if answers.get("budget_min"):
+        if answers.get("budget_min") and answers["budget_min"] != "SKIPPED":
             with contextlib.suppress(ValueError, TypeError):
                 lead.budget_min = int(answers["budget_min"])
-        if answers.get("preferred_location"):
+        if answers.get("preferred_location") and answers["preferred_location"] != "SKIPPED":
             lead.preferred_location = answers["preferred_location"]
-        if answers.get("purpose"):
+        if answers.get("purpose") and answers["purpose"] != "SKIPPED":
             lead.purpose = answers["purpose"]
-        if answers.get("move_in_timeline"):
+        if answers.get("move_in_timeline") and answers["move_in_timeline"] != "SKIPPED":
             lead.move_in_timeline = answers["move_in_timeline"]
+

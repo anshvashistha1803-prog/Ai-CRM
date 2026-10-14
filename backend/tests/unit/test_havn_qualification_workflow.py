@@ -294,9 +294,9 @@ async def test_full_buyer_qualification_and_broker_handoff(mock_db):
         "+919876543210",
     )
 
-    # Lead should be qualified and handed off to human
+    # Lead should be in QUALIFYING (awaiting broker review gate) and handed off to human
     assert resp.is_completed is True
-    assert lead.stage == LeadStage.QUALIFIED.value
+    assert lead.stage == LeadStage.QUALIFYING.value
     assert lead.automation_status == AutomationStatus.HUMAN_TAKEOVER.value
     assert lead.intent_score is not None and lead.intent_score >= 70
     assert lead.lead_health == "HOT"
@@ -330,7 +330,7 @@ async def test_seller_listing_flow(mock_db):
     )
 
     assert resp.is_completed is True
-    assert lead.stage == LeadStage.QUALIFIED.value
+    assert lead.stage == LeadStage.QUALIFYING.value
     assert lead.automation_status == AutomationStatus.HUMAN_TAKEOVER.value
     assert "HAVN SELLER LISTING SUMMARY" in resp.summary
     assert "Balbir Road" in resp.summary

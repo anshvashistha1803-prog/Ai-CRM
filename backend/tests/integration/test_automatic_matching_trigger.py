@@ -167,7 +167,7 @@ class TestAutomaticPropertyMatchingWorkflow:
                 status="AVAILABLE",
             )
             # Add non-matching property (different location/type)
-            prop_nomatch = await self._create_property(
+            await self._create_property(
                 session, tenant.id, "Luxury Villa Mussoorie",
                 price=55_000_000, property_type="VILLA", bhk=5, location="Mussoorie Road",
                 status="AVAILABLE",
@@ -435,10 +435,28 @@ class TestAutomaticPropertyMatchingWorkflow:
                 sender_phone="+919876543210",
             )
             await session.commit()
-            assert res.stage == "QUALIFIED"
+            assert res.stage == "QUALIFYING"
+
+        # 2. Broker reviews and accepts the qualification proposal (satisfying the broker review gate)
+        async with _make_session() as session:
+            admin_user = await self._create_user(session, tenant.id, role="AGENCY_ADMIN")
+            ctx = TenantContext(tenant_id=tenant.id, user_id=admin_user.id, role=UserRole.AGENCY_ADMIN)
+            from app.qualification.service import QualificationService
+
+            qual_svc = QualificationService(session, ctx)
+            proposal = await qual_svc.generate_proposal(
+                lead.id,
+                messages=[f"Looking for {answers['bhk']} BHK {answers['property_type']} in {answers['location']} for {answers['budget_max']}"],
+            )
+            accepted_prop = await qual_svc.review_proposal(lead.id, proposal.id, action="ACCEPT")
+            assert accepted_prop.status == "ACCEPTED"
+            await session.commit()
 
         # Check Outbox has both broker notification and match computation requested
         async with _make_session() as session:
+            lead_check = (await session.execute(sa.select(Lead).where(Lead.id == lead.id))).scalar_one()
+            assert lead_check.stage == "QUALIFIED"
+
             outbox_msgs = (await session.execute(
                 sa.select(OutboxMessage).where(OutboxMessage.aggregate_id == str(lead.id))
             )).scalars().all()

@@ -23,9 +23,45 @@ settings = get_settings()
 
 
 def _get_async_session():
-    """Create a scoped async sessionmaker for Celery worker processes."""
-    engine = create_async_engine(settings.database_url, echo=False)
+    """
+    Create a scoped async sessionmaker for Celery worker processes with strict database isolation.
+    Guarantees that test workers fail-fast if attempted against production or development databases.
+    """
+    import os
+    import sys
+
+    from sqlalchemy.engine import make_url
+
+    is_testing = (
+        bool(os.getenv("PYTEST_CURRENT_TEST"))
+        or "pytest" in sys.modules
+        or os.getenv("TESTING") == "1"
+        or settings.environment == "testing"
+    )
+
+    if is_testing:
+        test_db_url = os.getenv("TEST_DATABASE_URL")
+        if not test_db_url:
+            raise RuntimeError(
+                "CRITICAL: TEST_DATABASE_URL is required for worker tasks in testing mode. "
+                "Refusing to fall back to application database."
+            )
+        parsed = make_url(test_db_url)
+        if parsed.database != "havn_test":
+            raise RuntimeError(
+                f"CRITICAL: Test worker database must be 'havn_test', got '{parsed.database}'. "
+                "Refusing to execute."
+            )
+        db_url = test_db_url
+    else:
+        db_url = os.getenv("TEST_DATABASE_URL") or settings.database_url
+        parsed = make_url(db_url)
+        if parsed.database == "havn_crm" and os.getenv("TEST_DATABASE_URL"):
+            raise RuntimeError("CRITICAL: TEST_DATABASE_URL cannot point to 'havn_crm'. Refusing to execute.")
+
+    engine = create_async_engine(db_url, echo=False)
     return async_sessionmaker(engine, expire_on_commit=False)
+
 
 
 async def _handle_message_event(msg: OutboxMessage, db: AsyncSession | None = None) -> str | None:
@@ -48,13 +84,162 @@ async def _handle_message_event(msg: OutboxMessage, db: AsyncSession | None = No
             )
             return msg.payload["provider_message_id"]
 
-        recipient = msg.payload.get("recipient_phone") if msg.payload else None
-        text = msg.payload.get("message_text") if msg.payload else None
-        if not recipient or not text:
-            raise ValueError("Missing recipient_phone or message_text in payload.")
+        # Reconcile if already suppressed
+        if msg.payload and msg.payload.get("suppressed"):
+            logger.info(
+                "whatsapp_already_suppressed",
+                message_id=str(msg.id),
+                reason=msg.payload.get("suppression_reason"),
+            )
+            return f"suppressed:{msg.payload.get('suppression_reason', 'ineligible')}"
 
-        wa_client = WhatsAppClient()
-        res = await wa_client.send_text_message(recipient_phone=recipient, text=text)
+        recipient = msg.payload.get("recipient_phone") if msg.payload else None
+        template_name = msg.payload.get("template_name") if msg.payload else None
+        text = msg.payload.get("message_text") if msg.payload else None
+        if not recipient:
+            raise ValueError("Missing recipient_phone in payload.")
+
+        # Pre-flight revalidation immediately before external dispatch.
+        # Note: In distributed architectures, there is an unavoidable narrow window (microseconds)
+        # between database revalidation and provider HTTP socket write. Revalidating here as close
+        # as practical to dispatch minimizes this race condition.
+        from app.leads.models import ConsentRecord, Lead, LeadActivity
+        from app.tenants.models import Tenant
+
+        is_opt_out_notice = bool(
+            (msg.payload or {}).get("is_opt_out_notice")
+            or (msg.idempotency_key and msg.idempotency_key.startswith("ai-optout-"))
+        )
+
+        async def _revalidate_and_get_sender(session: AsyncSession) -> tuple[bool, str | None, str | None]:
+            if msg.aggregate_type != "LEAD":
+                return True, None, None
+
+            try:
+                lead_id = uuid.UUID(msg.aggregate_id)
+            except (ValueError, TypeError):
+                return False, "invalid_lead_id", None
+
+            # 1. Lead existence and tenant isolation
+            lead_stmt = select(Lead).where(
+                Lead.id == lead_id,
+                Lead.tenant_id == msg.tenant_id,
+            )
+            lead = (await session.execute(lead_stmt)).scalars().first()
+            if not lead:
+                return False, "lead_not_found_or_tenant_mismatch", None
+
+            if lead.is_deleted:
+                return False, "lead_is_deleted", None
+
+            # 2. Fetch tenant to get configured sender phone number ID
+            tenant_stmt = select(Tenant).where(Tenant.id == msg.tenant_id)
+            tenant = (await session.execute(tenant_stmt)).scalars().first()
+            tenant_phone_id = tenant.whatsapp_phone_number_id if tenant else None
+
+            # Allow approved compliance opt-out receipt even if lead is opted out
+            if is_opt_out_notice:
+                return True, None, tenant_phone_id
+
+            # 3. Standard qualification/outbound dispatch checks
+            if lead.do_not_contact:
+                return False, "lead_do_not_contact", tenant_phone_id
+
+            if lead.automation_status in {"OPTED_OUT", "HUMAN_TAKEOVER", "PAUSED"}:
+                return False, f"lead_automation_{lead.automation_status}", tenant_phone_id
+
+            # 4. Consent recheck
+            consent_stmt = (
+                select(ConsentRecord)
+                .where(
+                    ConsentRecord.tenant_id == msg.tenant_id,
+                    ConsentRecord.lead_id == lead_id,
+                )
+                .order_by(ConsentRecord.created_at.desc())
+            )
+            consent = (await session.execute(consent_stmt)).scalars().first()
+            if consent and not consent.granted:
+                return False, "consent_revoked", tenant_phone_id
+            if not consent:
+                return False, "missing_consent_record", tenant_phone_id
+
+            return True, None, tenant_phone_id
+
+        if db is not None:
+            is_eligible, suppression_reason, tenant_phone_id = await _revalidate_and_get_sender(db)
+        else:
+            session_factory = _get_async_session()
+            async with session_factory() as session:
+                is_eligible, suppression_reason, tenant_phone_id = await _revalidate_and_get_sender(session)
+
+        if not is_eligible:
+            logger.warning(
+                "whatsapp_outbound_dispatch_suppressed",
+                message_id=str(msg.id),
+                lead_id=str(msg.aggregate_id),
+                tenant_id=str(msg.tenant_id),
+                reason=suppression_reason,
+            )
+            # Update in-memory message payload so mark_sent commits the suppression details
+            updated_payload = dict(msg.payload) if msg.payload else {}
+            updated_payload["suppressed"] = True
+            updated_payload["suppression_reason"] = suppression_reason
+            msg.payload = updated_payload
+
+            # Record auditable activity
+            async def _record_suppression_activity(session: AsyncSession):
+                try:
+                    lead_id = uuid.UUID(msg.aggregate_id)
+                    lead_check = await session.get(Lead, lead_id)
+                    if not lead_check:
+                        return
+                    from datetime import UTC, datetime
+                    act = LeadActivity(
+                        id=uuid.uuid4(),
+                        tenant_id=msg.tenant_id,
+                        lead_id=lead_id,
+                        actor_type="SYSTEM",
+                        activity_type="OUTBOUND_MESSAGE_SUPPRESSED",
+                        description=f"Outbound WhatsApp message suppressed: {suppression_reason}",
+                        metadata_={"reason": suppression_reason, "outbox_message_id": str(msg.id)},
+                        created_at=datetime.now(UTC),
+                    )
+                    session.add(act)
+                    await session.flush()
+                except Exception as act_err:
+                    logger.warning("suppression_activity_recording_failed", error=str(act_err))
+
+            if db is not None:
+                await _record_suppression_activity(db)
+            else:
+                session_factory = _get_async_session()
+                async with session_factory() as session:
+                    await _record_suppression_activity(session)
+                    await session.commit()
+
+            return f"suppressed:{suppression_reason}"
+
+        # External network send executed outside long-lived DB transactions
+        wa_client = WhatsAppClient(default_phone_number_id=tenant_phone_id)
+        if template_name:
+            lang_code = msg.payload.get("language_code", "en_US")
+            components = msg.payload.get("components")
+            res = await wa_client.send_template_message(
+                recipient_phone=recipient,
+                template_name=template_name,
+                language_code=lang_code,
+                components=components,
+                phone_number_id=tenant_phone_id,
+            )
+        elif text:
+            res = await wa_client.send_text_message(
+                recipient_phone=recipient,
+                text=text,
+                phone_number_id=tenant_phone_id,
+            )
+        else:
+            raise ValueError("Missing both template_name and message_text in payload.")
+
         messages = res.get("messages", [])
         provider_id = messages[0].get("id") if messages else None
         if not provider_id:
@@ -63,33 +248,131 @@ async def _handle_message_event(msg: OutboxMessage, db: AsyncSession | None = No
 
     elif msg.event_type == "AI_QUALIFICATION_REQUESTED":
         lead_id = uuid.UUID(msg.aggregate_id)
-        text = msg.payload.get("message_text", "") if msg.payload else ""
-        sender_phone = msg.payload.get("sender_phone") if msg.payload else None
-        from app.qualification.conversation_service import QualificationConversationService
+        payload = msg.payload or {}
+        sender_phone = payload.get("sender_phone")
+        action = payload.get("action")
 
-        if db is not None:
-            conv_svc = QualificationConversationService(db)
-            try:
+        # Inbound WhatsApp conversational intake branch
+        if sender_phone and action != "GENERATE_PROPOSAL":
+            from app.qualification.conversation_service import QualificationConversationService
+
+            text = payload.get("message_text", "")
+            if db is not None:
+                conv_svc = QualificationConversationService(db)
                 await conv_svc.process_inbound_message(
                     lead_id=lead_id,
                     message_text=text,
                     sender_phone=sender_phone,
                 )
-            except Exception as exc:
-                logger.warning("ai_qualification_task_error", lead_id=str(lead_id), error=str(exc))
-        else:
-            session_factory = _get_async_session()
-            async with session_factory() as session:
-                conv_svc = QualificationConversationService(session)
-                try:
+            else:
+                session_factory = _get_async_session()
+                async with session_factory() as session:
+                    conv_svc = QualificationConversationService(session)
                     await conv_svc.process_inbound_message(
                         lead_id=lead_id,
                         message_text=text,
                         sender_phone=sender_phone,
                     )
                     await session.commit()
-                except Exception as exc:
-                    logger.warning("ai_qualification_task_error", lead_id=str(lead_id), error=str(exc))
+            return None
+
+        # Automatic AI qualification proposal creation branch
+        from app.core.dependencies import TenantContext, UserRole
+        from app.leads.models import Lead
+        from app.qualification.conversation_service import QualificationConversationService
+        from app.qualification.models import LeadQualificationProposal
+        from app.qualification.service import QualificationService
+
+        context = TenantContext(
+            tenant_id=msg.tenant_id,
+            user_id=None,
+            role=UserRole.SUPER_ADMIN,
+        )
+
+        async def _execute_proposal_generation(session: AsyncSession) -> None:
+            # 1. Strict tenant-isolated lead verification
+            stmt = select(Lead).where(
+                Lead.id == lead_id,
+                Lead.tenant_id == msg.tenant_id,
+                Lead.is_deleted.is_(False),
+            )
+            res = await session.execute(stmt)
+            lead = res.scalars().first()
+            if not lead:
+                logger.warning(
+                    "qualification_lead_not_found_or_tenant_mismatch",
+                    lead_id=str(lead_id),
+                    tenant_id=str(msg.tenant_id),
+                )
+                return None
+
+            # 2. Hard guard: Check automation status
+            if lead.automation_status in {
+                "HUMAN_TAKEOVER",
+                "PAUSED",
+                "OPTED_OUT",
+            }:
+                logger.info(
+                    "qualification_skipped_due_to_automation_status",
+                    lead_id=str(lead.id),
+                    status=lead.automation_status,
+                )
+                return None
+
+            # 3. Idempotency check: Do not create duplicate proposals on retries or repeated delivery
+            prop_stmt = select(LeadQualificationProposal).where(
+                LeadQualificationProposal.tenant_id == msg.tenant_id,
+                LeadQualificationProposal.lead_id == lead_id,
+                LeadQualificationProposal.status.in_(["PENDING_REVIEW", "ACCEPTED"]),
+            )
+            existing_prop = (await session.execute(prop_stmt)).scalars().first()
+            if existing_prop:
+                logger.info(
+                    "ai_qualification_proposal_already_exists",
+                    lead_id=str(lead_id),
+                    proposal_id=str(existing_prop.id),
+                    status=existing_prop.status,
+                )
+                conv_svc = QualificationConversationService(session)
+                await conv_svc.schedule_initial_contact(lead_id)
+                return None
+
+            # 4. Extract messages
+            extraction_messages = payload.get("messages")
+            if not extraction_messages:
+                text = payload.get("message_text")
+                if text:
+                    extraction_messages = [text]
+                elif lead.raw_message_text:
+                    extraction_messages = [lead.raw_message_text]
+                else:
+                    extraction_messages = [f"Lead created via {lead.source} for {lead.full_name}."]
+
+            qual_svc = QualificationService(session, context)
+            proposal = await qual_svc.generate_proposal(
+                lead_id=lead_id,
+                messages=extraction_messages,
+            )
+            logger.info(
+                "ai_qualification_proposal_automatically_created",
+                lead_id=str(lead_id),
+                proposal_id=str(proposal.id),
+                tenant_id=str(msg.tenant_id),
+            )
+
+            # Phase 9: For eligible website/Meta leads, schedule initial WhatsApp qualification outreach
+            conv_svc = QualificationConversationService(session)
+            await conv_svc.schedule_initial_contact(lead_id)
+            return None
+
+
+        if db is not None:
+            await _execute_proposal_generation(db)
+        else:
+            session_factory = _get_async_session()
+            async with session_factory() as session:
+                await _execute_proposal_generation(session)
+                await session.commit()
         return None
 
     elif msg.event_type == "BROKER_HANDOFF_NOTIFICATION":
@@ -229,10 +512,14 @@ async def _process_outbox_batch_async() -> int:
                 await db.commit()
             processed_count += 1
         except Exception as exc:
+            from app.messaging.whatsapp_client import WhatsAppAmbiguousDeliveryError
+
+            is_ambiguous = getattr(exc, "is_ambiguous", False) or isinstance(exc, WhatsAppAmbiguousDeliveryError)
             logger.error(
                 "outbox_processing_failed",
                 message_id=str(msg.id),
                 error=str(exc),
+                is_ambiguous=is_ambiguous,
             )
             try:
                 async with session_factory() as db:
@@ -242,6 +529,7 @@ async def _process_outbox_batch_async() -> int:
                         error_message=str(exc),
                         claimed_at=claimed_at,
                         claim_token=claim_token,
+                        is_ambiguous=is_ambiguous,
                     )
                     await db.commit()
             except Exception as commit_exc:
